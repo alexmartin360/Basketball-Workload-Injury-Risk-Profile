@@ -1,0 +1,61 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# R / RStudio
+.Rproj.user
+.Rhistory
+.RData
+.RDataTmp
+.Ruserdata
+*.Rproj.user
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Environment and secrets
+.env
+.env.*
+
+
+# Project docs & dependency manifest (kept local, not committed)
+README.md
+requirements.txt
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Generated / scraped data (rebuild with scripts)
+nba_injuries/
+nba_schedule/
+nba_player_travel/
+nba_player_tracking/
+nba_game_load/
+data_processed/
+Archive/
+
+# Large local artifacts
+*.parquet
+Theses/*.parquet
+
+# Scratch / notes exports (source lives in Theses/*.R)
+*.txt
+
+# knitr / R Markdown build artifacts (regenerate by knitting the .Rmd)
+*_cache/
+*_files/
+Theses/*.html
