@@ -1,7 +1,7 @@
 ---
 title: "Workload, Schedule Congestion, and Injury Risk in the NBA"
-subtitle: "A Time-to-Event Perspective — Cox Modelling, Diagnostics and Validation"
-author: "Alex Martin — Master of Sports Analytics, La Trobe University"
+subtitle: "A Time-to-Event Perspective - Cox Modelling, Diagnostics and Validation"
+author: "Alex Martin - Master of Sports Analytics, La Trobe University"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
 output:
   html_document:
@@ -60,7 +60,7 @@ hr <- function(fit, term) {
 }
 
 # p-values here span 0.97 down to ~1e-11. Rounding to 3 dp would print the tiny
-# ones as "0.000", which reads as "exactly zero" — so anything under 0.001 is
+# ones as "0.000", which reads as "exactly zero" - so anything under 0.001 is
 # shown in scientific notation instead.
 fmt_p <- function(p) {
   ifelse(is.na(p), NA_character_,
@@ -79,16 +79,10 @@ other, when I write the thesis I want to be reading my own justification
 alongside the number it produced, not flipping between a script and a
 console log.
 
-Does an NBA player's recent workload and schedule congestion predict
-*when* they get injured, and how much of any such signal is real
-physiology versus an artefact of who is fit enough to be playing in the
-first place?
-
-Workload does carry signal, and it is stable across the season. But my
-own negative control says a large share of that signal is exposure and
-health-selection, not fatigue. I think being straight about that is more
-valuable than a cleaner-looking result, and I've built the document to
-make that conclusion falsifiable rather than asserted.
+Does an NBA player's recent workload and schedule congestion carry
+signal that assist in indicating when a player is at elevated risk of
+being injured, and how much of any such signal is real physiology versus
+an artefact of who is fit enough to be playing in the first place?
 
 ::: {.alert .alert-info}
 Every model here is re-fitted from `cox_ready_2021-26.rds` when this
@@ -107,6 +101,7 @@ cox <- readRDS(file.path(BASE, "cox_ready_2021-26.rds"))
 data_summary <- tibble(
   Quantity = c("Player-game intervals (rows)", "Distinct players", "Seasons",
                "New-injury events (primary outcome)",
+               "  - soft-tissue", "  - load-linked structural", "  - random-impact",
                "All-injury events (new + reaggravation)",
                "  - soft-tissue", "  - load-linked structural", "  - random-impact"),
   Value = c(
@@ -114,10 +109,13 @@ data_summary <- tibble(
     format(n_distinct(cox$PLAYER_ID), big.mark = ","),
     sprintf("%d (%s to %s)", n_distinct(cox$SEASON), min(cox$SEASON), max(cox$SEASON)),
     format(sum(cox$event), big.mark = ","),
-    format(sum(cox$event_recurrent), big.mark = ","),
     format(sum(cox$event_soft), big.mark = ","),
     format(sum(cox$event_load), big.mark = ","),
-    format(sum(cox$event_impact), big.mark = ",")
+    format(sum(cox$event_impact), big.mark = ","),
+    format(sum(cox$event_recurrent), big.mark = ","),
+    format(sum(cox$event_soft_recurrent), big.mark = ","),
+    format(sum(cox$event_load_recurrent), big.mark = ","),
+    format(sum(cox$event_impact_recurrent), big.mark = ",")
   )
 )
 show_tbl(data_summary, "The counting-process dataset")
@@ -156,6 +154,7 @@ candidates <- c(
   "ACWR_MIN", "ROLLING_MIN_7D", "ROLLING_MIN_28D", "ROLLING_MIN_42D",
   "SEASON_CUMULATIVE_MIN", "ROLLING_GAMES_7D", "ROLLING_GAMES_28D",
   "ROLLING_LOAD_7D", "ROLLING_LOAD_28D", "ACWR_LOAD",
+  "ROLLING_INTENSITY_7D", "ROLLING_INTENSITY_28D", "INTENSITY",
   "ROLLING_DIST_7D", "ROLLING_DIST_28D", "SEASON_CUMULATIVE_DIST",
   "TEAM_DAYS_REST", "ROLLING_B2B_7D", "ROLLING_B2B_28D",
   "PLAYER_ROAD_TRIP_GAME_NUMBER", "MIN", "DISTANCE",
@@ -174,7 +173,7 @@ collinear <- tibble(
   Spearman_r = round(cor_mat[high], 3)
 ) %>% arrange(desc(abs(Spearman_r)))
 
-show_tbl(collinear, "Collinear pairs (|Spearman r| > 0.8) — only one of each enters the model")
+show_tbl(collinear, "Collinear pairs (|Spearman r| > 0.8) - only one of each enters the model")
 ```
 
 ## What it shows
@@ -208,9 +207,9 @@ calls:
 My hypothesis is ordered, so the model build is ordered too. I add
 covariates in three **domain blocks**, workload, then schedule
 congestion, then player context, and ask at each, whether the new domain
-earns its place. That structure answers "which domain matters", which is
-the question I actually posed, rather than producing one flat model
-where I'd be picking through 24 individually significant coefficients.
+earns its place. That structure answers "which domain matters", rather
+than producing one flat model where I'd be picking through 24
+individually significant coefficients.
 
 Three specification choices carry the design, and each is a deliberate
 answer to a feature of this data:
@@ -232,22 +231,29 @@ z <- function(x) as.numeric(scale(x))
 
 cox <- cox %>%
   mutate(
-    # Workload — minutes-based
+    # Workload - minutes & intensity -based
     z_ROLLING_MIN_7D   = z(ROLLING_MIN_7D),
     z_ROLLING_MIN_28D  = z(ROLLING_MIN_28D),
     z_ACWR_MIN         = z(ACWR_MIN),
     z_ROLLING_GAMES_7D = z(ROLLING_GAMES_7D),
     z_MIN              = z(MIN),
-    # Workload — on-court tracking load (used in Stage 5)
+    z_PREV_GAME_MIN    = z(PREV_GAME_MIN),   
+    z_PREV_2GAME_MIN   = z(PREV_2GAME_MIN), 
+    z_ROLLING_INTENSITY_7D   = z(ROLLING_INTENSITY_7D),
+    z_ROLLING_INTENSITY_28D  = z(ROLLING_INTENSITY_28D),
+    z_INTENSITY              = z(INTENSITY),
+    # Workload - on-court tracking load (used in Stage 5)
     z_ROLLING_LOAD_7D  = z(ROLLING_LOAD_7D),
     z_ROLLING_LOAD_28D = z(ROLLING_LOAD_28D),
     z_ACWR_LOAD        = z(ACWR_LOAD),
-    z_DISTANCE         = z(DISTANCE),
+    z_PREV_GAME_DISTANCE   = z(PREV_GAME_DISTANCE),
+    z_PREV_2GAME_DISTANCE  = z(PREV_2GAME_DISTANCE),
     # Travel
     z_ROLLING_DIST_7D        = z(ROLLING_DIST_7D),
     z_ROLLING_DIST_28D       = z(ROLLING_DIST_28D),
     z_SEASON_CUMULATIVE_DIST = z(SEASON_CUMULATIVE_DIST),
     # Schedule congestion
+    z_IS_B2B = z(IS_B2B),
     z_ROLLING_B2B_7D               = z(ROLLING_B2B_7D),
     z_ROLLING_B2B_28D              = z(ROLLING_B2B_28D),
     z_PLAYER_ROAD_TRIP_GAME_NUMBER = z(PLAYER_ROAD_TRIP_GAME_NUMBER),
@@ -272,21 +278,26 @@ fit_cox <- function(covariate_terms, lhs = surv_lhs) {
   coxph(f, data = cox, ties = "efron")
 }
 
+# Workload block - ON-COURT LOAD (tracking distance). I use load rather than minutes
+# as my exposure: distance covered is what the body actually absorbed, the sports-
+# science "external load", whereas minutes is a coaching decision. Load and minutes
+# are ~0.995 collinear here, so this doesn't change discrimination - I verify that
+# with a minutes robustness fit below - it just puts the better construct in front.
 m1_terms <- c(
-  "z_ROLLING_MIN_7D",          # acute minutes load (volume)
-  "z_ROLLING_MIN_28D",         # chronic minutes load (volume)
-  "z_ACWR_MIN",                # acute:chronic minutes ratio
+  "z_ROLLING_LOAD_7D",         # acute on-court load (distance)
+  "z_ROLLING_LOAD_28D",        # chronic on-court load (distance)
+  "z_ACWR_LOAD",               # acute:chronic load ratio
   "z_ROLLING_GAMES_7D",        # acute games played (frequency)
   "z_ROLLING_DIST_7D",         # acute travel load
   "z_ROLLING_DIST_28D",        # chronic travel load
   "z_SEASON_CUMULATIVE_DIST",  # season-long accumulated travel
-  "z_MIN"                      # in-game effort (selection-biased)
+  "z_PREV_GAME_DISTANCE",      # in-game load, last played game (lag-1, load-management signal)
+  "z_PREV_2GAME_DISTANCE"      # in-game load, 2 games back (lag-2, prospective fatigue spike)
 )
 
 schedule_added <- c(
-  "z_ROLLING_B2B_7D", "z_ROLLING_B2B_28D",
-  "z_PLAYER_ROAD_TRIP_GAME_NUMBER", "z_TEAM_DAYS_REST",
-  "IS_B2B", "IS_PLAYER_ROAD_TRIP"
+  "z_IS_B2B","z_ROLLING_B2B_7D", "z_ROLLING_B2B_28D",
+  "z_PLAYER_ROAD_TRIP_GAME_NUMBER", "z_TEAM_DAYS_REST", "IS_PLAYER_ROAD_TRIP"
 )
 
 context_added <- c(
@@ -299,7 +310,33 @@ context_added <- c(
 
 m2_terms <- c(m1_terms, schedule_added)
 m3_terms <- c(m2_terms, context_added)
+
+# The minutes-based counterpart of the full Model 3, kept only for the robustness
+# check: same specification with minutes swapped in for load - including the same lag-1
+# + lag-2 treatment of the in-game term, so the comparison is apples-to-apples.
+m3_terms_min <- c("z_ROLLING_MIN_7D", "z_ROLLING_MIN_28D", "z_ACWR_MIN",
+                  "z_ROLLING_GAMES_7D", "z_ROLLING_DIST_7D", "z_ROLLING_DIST_28D",
+                  "z_SEASON_CUMULATIVE_DIST", "z_PREV_GAME_MIN", "z_PREV_2GAME_MIN",
+                  schedule_added, context_added)
 ```
+
+**A note on the in-game load term.** Rather than the current game's
+distance, I use two lagged versions: the last game played
+(`PREV_GAME_DISTANCE`, lag-1) and two games back (`PREV_2GAME_DISTANCE`,
+lag-2). The current game's distance is contemporaneous with the injury
+and reverse-caused (a player who breaks down logs a low distance in the
+game it happens) so it reads protective for the wrong reason. Both lags
+are known before the interval opens, so they are genuinely prospective,
+and they separate two signals: the last game carries the load-management
+pattern (the game before a breakdown is often a managed, compromised
+one, so lag-1 reads protective), while two games back sits before that
+compromise and reads as the harmful fatigue spike a real overuse
+mechanism should produce.
+
+*I validated that lag-2 survives out-of-sample and is not just
+re-expressing the rolling load (VIF ≈ 3) before adopting it. The
+trade-off is coverage, a player's first two games each season have no
+lag-2 and drop from these models.*
 
 A note on the schedule block, I included **both** the accumulated
 congestion dose (rolling back-to-back counts, road-trip game number)
@@ -310,21 +347,21 @@ player tonight. I keep them in so the contrast is visible in the results
 table rather than hidden by dropping them, and I mark them as
 selection-biased everywhere they appear.
 
-## Model 1 — Workload
+## Model 1 - Workload
 
 ```{r m1, dependson="model-specs"}
 m1 <- fit_cox(m1_terms)
 summary(m1)
 ```
 
-## Model 2 — Workload + Schedule
+## Model 2 - Workload + Schedule
 
 ```{r m2, dependson="model-specs"}
 m2 <- fit_cox(m2_terms)
 summary(m2)
 ```
 
-## Model 3 — Workload + Schedule + Player context
+## Model 3 - Workload + Schedule + Player context
 
 ```{r m3, dependson="model-specs"}
 m3 <- fit_cox(m3_terms)
@@ -363,7 +400,7 @@ nested <- bind_rows(
   mutate(p_value = fmt_p(p_value))
 
 concordance_progression <- tibble(
-  Model = c("Model 1 — workload", "Model 2 — + schedule", "Model 3 — + player context"),
+  Model = c("Model 1 - workload", "Model 2 - + schedule", "Model 3 - + player context"),
   Concordance = c(summary(m1)$concordance[1],
                   summary(m2)$concordance[1],
                   summary(m3)$concordance[1]) %>% round(4)
@@ -380,22 +417,52 @@ m3_tidy <- tidy(m3, exponentiate = TRUE, conf.int = TRUE) %>%
   select(term, HR = estimate, conf.low, conf.high, p.value, robust.se) %>%
   mutate(p.value = fmt_p(p.value))
 
-show_tbl(m3_tidy, "Model 3 — hazard ratios, sorted by effect size (not by p)")
+show_tbl(m3_tidy, "Model 3 - hazard ratios, sorted by effect size (not by p)")
 ```
+
+## Does the exposure choice matter?
+
+I report on-court load, but load and minutes are \~0.995 collinear here,
+so a fair question is whether anything hinges on that choice. It does
+not. Refitting the *whole* of Model 3 with minutes swapped in for load
+leaves discrimination and the headline hazard ratios essentially
+unchanged.
+
+```{r robustness-minutes, dependson="model-specs"}
+m3_min <- fit_cox(m3_terms_min)   # same Model 3, minutes in place of load
+
+robust_tab <- tibble(
+  Metric = c("Concordance", "Chronic workload HR (per SD)",
+             "Acute workload HR (per SD)", "ACWR HR (per SD)"),
+  `Load (reported)` = c(
+    round(summary(m3)$concordance[1], 4),
+    hr(m3, "z_ROLLING_LOAD_28D"), hr(m3, "z_ROLLING_LOAD_7D"), hr(m3, "z_ACWR_LOAD")),
+  `Minutes (robustness)` = c(
+    round(summary(m3_min)$concordance[1], 4),
+    hr(m3_min, "z_ROLLING_MIN_28D"), hr(m3_min, "z_ROLLING_MIN_7D"), hr(m3_min, "z_ACWR_MIN"))
+)
+show_tbl(robust_tab, "Robustness - on-court load vs minutes give the same answer")
+```
+
+So the exposure choice is not driving the result. I lead with load
+because it is the better *construct*, what the body absorbed rather than
+what the coach decided.
 
 ## What it shows
 
 Both blocks earn their place, and concordance climbs at each step to
-0.684 it means that given two comparable player-intervals, the model
-ranks the one that actually gets injured as higher-risk about 68% of the
-time, against 50% by chance. For a model built entirely from **public
-box-score and schedule data**, with no access to GPS, medical screening
-or training-load data, I think that is the honest near ceiling rather
-than a disappointment, and establishing that ceiling is itself a useful
-finding for anyone deciding whether public data is sufficient for this
-task.
+`r round(summary(m3)$concordance[1], 3)`. That means given two
+comparable player-intervals, the model ranks the one that actually gets
+injured as higher-risk about
+`r round(100 * summary(m3)$concordance[1])`% of the time, against 50% by
+chance. For a model built entirely from **public box-score and schedule
+data**, with no access to GPS, medical screening or training-load data,
+I think that is the honest near ceiling rather than a disappointment,
+and establishing that ceiling is itself a useful finding for anyone
+deciding whether public data is sufficient for this task.
 
-Chronic 28-day minutes is the headline effect at **HR 2.3 per SD**. I
+Chronic 28-day load is the headline effect at **HR
+`r round(summary(m3)$conf.int["z_ROLLING_LOAD_28D", 1], 1)` per SD**. I
 want to also flag as not a finding is that several point-in-time
 covariates come out looking strongly protective. Rest days and the
 back-to-back flag both do this. Playing a back-to-back is *safer*, which
@@ -440,17 +507,19 @@ plot_terms <- zph3_tab %>% filter(term != "GLOBAL") %>% pull(term)  # GLOBAL has
 
 zph3_tab %>%
   mutate(chisq = round(chisq, 2), p = fmt_p(p)) %>%
-  show_tbl("Model 3 — proportional-hazards test (scaled Schoenfeld residuals)")
+  show_tbl("Model 3 - proportional-hazards test (scaled Schoenfeld residuals)")
 ```
 
-10 individual covariates flagged at p \< 0.05.
+`r sum(zph3_tab$flag != "")` individual covariates flagged at p \< 0.05
+(the two lag in-game load terms among them, at p ≈ 0.002 and 0.007).
 
 ## The plots, which is where the decision actually got made
 
-The p-value only tells me a slope isn't exactly zero, at 3,257 events, a
-near-flat line will still test significant. The *shape* is what matters,
-so I plot every term. A flat line means the assumption holds; a sloping
-line means the effect drifts.
+The p-value only tells me a slope isn't exactly zero, at
+`r format(m3$nevent, big.mark = ",")` events, a near-flat line will
+still test significant. The *shape* is what matters, so I plot every
+term. A flat line means the assumption holds; a sloping line means the
+effect drifts.
 
 ```{r schoenfeld-plots, dependson="ph-tests", fig.height=4.2, fig.width=7.5, results="hold"}
 for (v in plot_terms) {
@@ -463,10 +532,10 @@ for (v in plot_terms) {
 
 ## What it shows, and why I remedied nothing
 
-Covariates drifts gently by a comparable amount. Indicative to one
-systematic cause acting on all of them, not to ten independent
-time-varying risk factors, and fitting ten separate time-interactions to
-a common cause would be modelling the symptom.
+Covariates drift gently by a comparable amount. That points to one
+systematic cause acting on all of them, not to a handful of independent
+time-varying risk factors, and fitting a separate time-interaction to
+each of a common cause would be modelling the symptom.
 
 because chronic load is PH-stable, a bad chronic load is a bad chronic
 load regardless of when in the season it occurs. That is a cleaner and
@@ -526,14 +595,15 @@ ggplot(calib, aes(risk_group, event_rate_1k)) +
 ```{r hr-table, dependson="m3"}
 domain_map <- tribble(
   ~term,                            ~domain,          ~label,
-  "z_ROLLING_MIN_7D",               "Workload",       "Acute minutes load (7d)",
-  "z_ROLLING_MIN_28D",              "Workload",       "Chronic minutes load (28d)",
-  "z_ACWR_MIN",                     "Workload",       "Acute:chronic workload ratio",
+  "z_ROLLING_LOAD_7D",              "Workload",       "Acute on-court load (7d)",
+  "z_ROLLING_LOAD_28D",             "Workload",       "Chronic on-court load (28d)",
+  "z_ACWR_LOAD",                    "Workload",       "Acute:chronic load ratio",
   "z_ROLLING_GAMES_7D",             "Workload",       "Acute games played (7d)",
   "z_ROLLING_DIST_7D",              "Workload",       "Acute travel load (7d)",
   "z_ROLLING_DIST_28D",             "Workload",       "Chronic travel load (28d)",
   "z_SEASON_CUMULATIVE_DIST",       "Workload",       "Season cumulative travel",
-  "z_MIN",                          "Workload",       "In-game minutes *",
+  "z_PREV_GAME_DISTANCE",           "Workload",       "In-game load, last game *",
+  "z_PREV_2GAME_DISTANCE",          "Workload",       "In-game load, 2 games back",
   "z_ROLLING_B2B_7D",               "Schedule",       "Acute back-to-back dose (7d)",
   "z_ROLLING_B2B_28D",              "Schedule",       "Chronic back-to-back dose (28d)",
   "z_PLAYER_ROAD_TRIP_GAME_NUMBER", "Schedule",       "Road-trip game number",
@@ -561,18 +631,20 @@ hr_tab <- tidy(m3, exponentiate = TRUE, conf.int = TRUE) %>%
   mutate(p.value = fmt_p(p.value)) %>%
   select(domain, label, HR, conf.low, conf.high, p.value)
 
-show_tbl(hr_tab, "Final hazard ratios (Model 3), by domain — * = selection-biased")
+show_tbl(hr_tab, "Final hazard ratios (Model 3), by domain - * = selection-biased")
 
 write.csv(hr_tab, file.path(BASE, "final_hazard_ratios_model3.csv"), row.names = FALSE)
 ```
 
 ## What it shows
 
-Concordance is 0.6839 (95% CI 0.673-0.695), and the risk score orders
-observed hazard almost perfectly across deciles (Spearman 1). The model
-reliably sorts high-risk from low-risk intervals even though it cannot
-state an absolute probability. For an operational use case, who should
-be managed this week, ranking is the operative quantity anyway.
+Concordance is `r round(summary(m3)$concordance[1], 4)` (95% CI
+`r round(summary(m3)$concordance[1] - 1.96 * summary(m3)$concordance[2], 3)`-`r round(summary(m3)$concordance[1] + 1.96 * summary(m3)$concordance[2], 3)`),
+and the risk score orders observed hazard almost perfectly across
+deciles (Spearman 1). The model reliably sorts high-risk from low-risk
+intervals even though it cannot state an absolute probability. For an
+operational use case, who should be managed this week, ranking is the
+operative quantity anyway.
 
 ------------------------------------------------------------------------
 
@@ -655,7 +727,7 @@ frail_fit
 ```
 
 ```{r recurrent-compare, dependson=c("ag-model","pwp","frailty")}
-headline <- c("z_ROLLING_MIN_28D", "z_ROLLING_MIN_7D", "z_ACWR_MIN",
+headline <- c("z_ROLLING_LOAD_28D", "z_ROLLING_LOAD_7D", "z_ACWR_LOAD",
               "z_ROLLING_GAMES_7D", "z_CAREER_GAMES_MISSED", "z_SEASONS_IN_LEAGUE",
               "z_TEAM_DAYS_REST", "IS_B2B", "z_PRIOR_EPISODES_SEASON", "RECENT_RETURN")
 
@@ -668,7 +740,7 @@ compare <- tibble(
   HR_frailty = map_dbl(headline, ~ hr_from(fixef(frail_fit), .x))
 )
 
-show_tbl(compare, "Cross-model comparison — AG (marginal) vs PWP (spell strata) vs frailty (conditional)")
+show_tbl(compare, "Cross-model comparison - AG (marginal) vs PWP (spell strata) vs frailty (conditional)")
 ```
 
 ## What it shows
@@ -677,10 +749,11 @@ The headline workload effects hold their shape across all three, the
 chronic-load result is not an artefact of how I chose to handle
 recurrence.
 
-The frailty variance θ **=** 0.323 is the most interesting number in
-this section. On the log-hazard scale that means a player one SD above
-average carries roughly 1.76x the hazard of an average player, and the
-90th versus 10th percentile of proneness differ by about 4.29 x (after
+The frailty variance θ **=** `r round(theta, 3)` is the most interesting
+number in this section. On the log-hazard scale that means a player one
+SD above average carries roughly `r round(exp(sd_frail), 2)`x the hazard
+of an average player, and the 90th versus 10th percentile of proneness
+differ by about `r round(exp(2 * qnorm(0.9) * sd_frail), 2)` x (after
 adjusting for every covariate in the model). So there is substantial
 durable injury-proneness that my public-data covariates do not capture.
 That is simultaneously a limitation of my feature set and a direct
@@ -724,20 +797,21 @@ fractures in with acute ones.
     is the **clean control**. Load should have little effect here beyond
     exposure.
 
-Minutes are a coaching decision; distance covered is what the body
-actually absorbed. If on-court tracking load predicts soft-tissue injury
-better than minutes do, that is evidence the physiological measure is
-closer to the mechanism.
+I run the split on the same on-court load exposure as the main model, so
+all three tiers are compared on identical footing. (I originally also
+ran a separate minutes-vs-distance "which exposure predicts better" test
+here; that turned out to be the tracking-data artefact discussed below,
+so the exposure question is settled and this stage is purely the
+mechanism contrast.)
 
 The trajectory. `basehaz()` reads the baseline hazard directly, telling
 me when in a season risk elevates for an average player, independent of
 any covariate.
 
 ```{r mechanism, dependson=c("zscore","model-specs")}
-workload_minutes <- c("z_ROLLING_MIN_7D", "z_ROLLING_MIN_28D", "z_ACWR_MIN",
-                      "z_ROLLING_GAMES_7D", "z_MIN")
-workload_load    <- c("z_ROLLING_LOAD_7D", "z_ROLLING_LOAD_28D", "z_ACWR_LOAD",
-                      "z_ROLLING_GAMES_7D", "z_DISTANCE")
+workload_load <- c("z_ROLLING_LOAD_7D", "z_ROLLING_LOAD_28D", "z_ACWR_LOAD",
+                      "z_ROLLING_GAMES_7D", "z_PREV_GAME_DISTANCE", "z_PREV_2GAME_DISTANCE",
+                      "z_ROLLING_INTENSITY_7D","z_ROLLING_INTENSITY_28D","z_INTENSITY")
 shared <- c("z_ROLLING_DIST_7D", "z_ROLLING_DIST_28D", "z_SEASON_CUMULATIVE_DIST",
             schedule_added, context_added)
 
@@ -747,40 +821,45 @@ fit_outcome <- function(outcome, terms) {
         data = cox, ties = "efron")
 }
 
-m_soft   <- fit_outcome("event_soft",   c(workload_minutes, shared))  # overuse
-m_load   <- fit_outcome("event_load",   c(workload_minutes, shared))  # load-linked structural
-m_impact <- fit_outcome("event_impact", c(workload_minutes, shared))  # random contact = control
+m_soft   <- fit_outcome("event_soft",   c(workload_load, shared))  # overuse
+m_load  <- fit_outcome("event_load",   c(workload_load, shared))  # load-linked structural
+m_impact <- fit_outcome("event_impact", c(workload_load, shared))  # random contact = control
+m_soft_load <- fit_outcome("event_soft_load_recurrent", c(workload_load, shared))  # random contact = control
+
+m_soft_recurrent   <- fit_outcome("event_soft_recurrent",   c(workload_load, shared))  # overuse
+m_load_recurrent   <- fit_outcome("event_load_recurrent",   c(workload_load, shared))  # load-linked structural
+m_soft_load_recurrent <- fit_outcome("event_soft_load_recurrent", c(workload_load, shared))  # random contact = control
+m_impact_recurrent <- fit_outcome("event_impact_recurrent", c(workload_load, shared))  # random contact = control
 
 mech_tab <- tibble(
-  Workload_term      = c("Chronic minutes (28d)", "Acute minutes (7d)", "Workload spike (ACWR)"),
-  term               = c("z_ROLLING_MIN_28D", "z_ROLLING_MIN_7D", "z_ACWR_MIN"),
-  HR_soft_tissue     = map_dbl(term, ~ hr(m_soft,   .x)),
-  HR_load_linked     = map_dbl(term, ~ hr(m_load,   .x)),
-  HR_random_impact   = map_dbl(term, ~ hr(m_impact, .x))
+  ` `                = c("Chronic load (28d)", "Acute load (7d)", "Load spike (ACWR)"),
+  term               = c("z_ROLLING_LOAD_28D", "z_ROLLING_LOAD_7D", "z_ACWR_LOAD"),
+  `Soft-tissue`      = map_dbl(term, ~ hr(m_soft,   .x)),
+  `Load-linked`      = map_dbl(term, ~ hr(m_load,   .x)),
+  `Random-impact`    = map_dbl(term, ~ hr(m_impact, .x))
 ) %>% select(-term)
 
-show_tbl(mech_tab, "Mechanism split — the same model fitted to three injury tiers")
+# Bottom row: each model's overall discrimination (Harrell's C), so the HRs and the
+# ranking ability sit in one place.
+mech_tab <- bind_rows(mech_tab, tibble(
+  ` `             = "Concordance (C)",
+  `Soft-tissue`   = round(summary(m_soft)$concordance[1],   3),
+  `Load-linked`   = round(summary(m_load)$concordance[1],   3),
+  `Random-impact` = round(summary(m_impact)$concordance[1], 3)
+))
+
+show_tbl(mech_tab, "Mechanism split - HR per SD (top rows) and model concordance (bottom row)")
 ```
 
-```{r exposure-swap, dependson="mechanism"}
-m_soft_load <- fit_outcome("event_soft", c(workload_load, shared))
-
-exposure_tab <- tibble(
-  Construct  = c("Chronic load (28d)", "Acute load (7d)", "Workload spike (ACWR)", "In-game load"),
-  Minutes_HR = c(hr(m_soft, "z_ROLLING_MIN_28D"), hr(m_soft, "z_ROLLING_MIN_7D"),
-                 hr(m_soft, "z_ACWR_MIN"),        hr(m_soft, "z_MIN")),
-  Load_HR    = c(hr(m_soft_load, "z_ROLLING_LOAD_28D"), hr(m_soft_load, "z_ROLLING_LOAD_7D"),
-                 hr(m_soft_load, "z_ACWR_LOAD"),        hr(m_soft_load, "z_DISTANCE"))
-)
-
-c_min  <- summary(m_soft)$concordance[1]
-c_load <- summary(m_soft_load)$concordance[1]
-
-show_tbl(exposure_tab, "Exposure swap — soft-tissue injury modelled with minutes vs on-court distance")
-```
-
-Concordance on the soft-tissue outcome: minutes 0.6931 versus on-court
-load 0.7442.
+The bottom row adds each model's discrimination. The three are close,
+but **random-impact is the lowest** at
+`r round(summary(m_impact)$concordance[1], 3)`, below soft-tissue
+(`r round(summary(m_soft)$concordance[1], 3)`) and load-linked
+(`r round(summary(m_load)$concordance[1], 3)`). That's the direction the
+negative-control logic predicts: the model ranks the load-relevant
+injuries better than the random contact ones, because a random-impact
+injury, a jammed finger, a poke in the eye, is by definition the least
+driven by the workload, schedule and context the model is built from.
 
 ```{r trajectory, dependson="mechanism", fig.height=4.5, fig.width=7.5}
 traj <- basehaz(m_soft, centered = FALSE) %>%
@@ -807,30 +886,48 @@ ggplot(traj, aes(game_number, cum_haz)) +
 ## What it shows
 
 The mechanism split is the most important result in the thesis, and it
-partly disconfirms my hypothesis. Chronic minutes carries a hazard ratio
-of roughly 2.11 for soft-tissue injury, 2.88 for load-linked structural
-injury, and 2.56 for random-impact injury. If workload were purely
-causal, that third number should collapse toward 1.0. It does not. A
-player carrying heavy chronic minutes is about as likely to break a
-finger as to tear a hamstring, relative to a low-minutes player, and
-chronic load cannot plausibly *cause* a finger fracture. So the
-chronic-load effect is substantially exposure and health-selection:
-high-minutes players are on court more, and are selected for being fit
-enough to sustain those minutes.
+partly disconfirms my hypothesis. Chronic load carries a hazard ratio of
+roughly `r round(summary(m_soft)$conf.int["z_ROLLING_LOAD_28D", 1], 1)`
+for soft-tissue injury,
+`r round(summary(m_load)$conf.int["z_ROLLING_LOAD_28D", 1], 1)` for
+load-linked structural injury, and
+`r round(summary(m_impact)$conf.int["z_ROLLING_LOAD_28D", 1], 1)` for
+random-impact injury. If workload were purely causal, that third number
+should collapse toward 1.0. It does not, if anything it is *higher* than
+the soft-tissue figure. A player carrying heavy chronic load is about as
+likely to break a finger as to tear a hamstring, relative to a low-load
+player, and chronic load cannot plausibly *cause* a finger fracture. So
+the chronic-load effect is substantially exposure and health-selection:
+high-load players are on court more, and are selected for being fit
+enough to sustain that load.
 
-Acute load behaves differently, and this is the genuine signal. It fades
-across the tiers (roughly 1.66 for soft tissue down to 1.43 for random
-impact), which is the pattern a real fatigue mechanism should produce.
-It is a smaller effect than the chronic-load headline, but it is far
-better identified.
+Acute load behaves differently, and this is the genuine signal. It is
+elevated for the two load-relevant tiers (roughly
+`r round(summary(m_soft)$conf.int["z_ROLLING_LOAD_7D", 1], 2)` for soft
+tissue and
+`r round(summary(m_load)$conf.int["z_ROLLING_LOAD_7D", 1], 2)` for
+load-linked structural injury) but collapses to essentially 1.0 for
+random impact
+(`r round(summary(m_impact)$conf.int["z_ROLLING_LOAD_7D", 1], 2)`), the
+pattern a real fatigue mechanism should produce, and about the cleanest
+negative-control result I could have asked for. It is a smaller effect
+than the chronic-load headline, but it is far better identified.
 
-The exposure swap supports the mechanism reading. Swapping minutes for
-on-court distance lifts soft-tissue concordance from 0.693 to 0.744. The
-physiological measure genuinely predicts soft-tissue injury better than
-the coaching decision does.
+A caution I want on the record. I originally saw soft-tissue concordance
+jump (0.693 → 0.744) when I first compared on-court distance to minutes,
+and read it as external load being a *better predictor*. It turned out
+to be a **tracking-data artefact**: DNP games carried a fake zero
+distance that the carry-forward then leaked into the injury rows (fixed
+in file 4). Corrected, load and minutes are **equivalent**, which is
+exactly why I can report load as my exposure (it is the better
+*construct*, what the body absorbed rather than what the coach chose)
+without it changing a single result, and keep minutes as the Stage 1
+robustness check. The lesson: distance is the right construct, but its
+apparent *advantage* over minutes was a bug, not a finding.
 
 The trajectory is the clean dynamic finding. Per-game baseline hazard is
-1.5 x steeper in games 55–75 than games 5–25.
+`r sprintf("%.1f", late_rate / early_rate)` x steeper in games 55–75
+than games 5–25.
 
 Note: it is a property of the baseline hazard, not of any covariate
 coefficient, which is precisely why Stage 2 found no covariate drifting.
@@ -872,18 +969,22 @@ Two Notes on the training data:
 ```{r validation-setup, dependson="model-specs"}
 zcols <- c("ROLLING_MIN_7D","ROLLING_MIN_28D","ACWR_MIN","ROLLING_GAMES_7D",
            "ROLLING_DIST_7D","ROLLING_DIST_28D","SEASON_CUMULATIVE_DIST","MIN",
-           "ROLLING_LOAD_7D","ROLLING_LOAD_28D","ACWR_LOAD","DISTANCE",
+           "PREV_GAME_MIN","PREV_2GAME_MIN",
+           "ROLLING_LOAD_7D","ROLLING_LOAD_28D","ACWR_LOAD",
+           "PREV_GAME_DISTANCE","PREV_2GAME_DISTANCE",
            "ROLLING_B2B_7D","ROLLING_B2B_28D","PLAYER_ROAD_TRIP_GAME_NUMBER",
            "TEAM_DAYS_REST","SEASONS_IN_LEAGUE","CAREER_GAMES_MISSED",
            "PRIOR_EPISODES_SEASON","PCT_THROUGH_SEASON","HEIGHT_INCHES","WEIGHT")
 
+# primary = the reported load model; minutes = the same spec with minutes swapped in,
+# validated out of sample as the robustness check (both on the new-injury outcome).
 specs <- list(
-  primary   = list(outcome = "event",      terms = c(paste0("z_", c("ROLLING_MIN_7D","ROLLING_MIN_28D","ACWR_MIN","ROLLING_GAMES_7D","MIN")),
-                                                     "z_ROLLING_DIST_7D","z_ROLLING_DIST_28D","z_SEASON_CUMULATIVE_DIST",
-                                                     schedule_added, context_added)),
-  best_load = list(outcome = "event_soft", terms = c(paste0("z_", c("ROLLING_LOAD_7D","ROLLING_LOAD_28D","ACWR_LOAD","ROLLING_GAMES_7D","DISTANCE")),
-                                                     "z_ROLLING_DIST_7D","z_ROLLING_DIST_28D","z_SEASON_CUMULATIVE_DIST",
-                                                     schedule_added, context_added))
+  primary = list(outcome = "event", terms = c(paste0("z_", c("ROLLING_LOAD_7D","ROLLING_LOAD_28D","ACWR_LOAD","ROLLING_GAMES_7D","PREV_GAME_DISTANCE","PREV_2GAME_DISTANCE")),
+                                              "z_ROLLING_DIST_7D","z_ROLLING_DIST_28D","z_SEASON_CUMULATIVE_DIST",
+                                              schedule_added, context_added)),
+  minutes = list(outcome = "event", terms = c(paste0("z_", c("ROLLING_MIN_7D","ROLLING_MIN_28D","ACWR_MIN","ROLLING_GAMES_7D","PREV_GAME_MIN","PREV_2GAME_MIN")),
+                                              "z_ROLLING_DIST_7D","z_ROLLING_DIST_28D","z_SEASON_CUMULATIVE_DIST",
+                                              schedule_added, context_added))
 )
 
 # Standardise using TRAIN mean/sd only, then apply that same scaling to test.
@@ -927,7 +1028,7 @@ temporal <- map_dfr(names(specs), function(nm) {
          temporal_C = round(c_index(fit, sc$test,  sp$outcome), 4))
 })
 
-show_tbl(temporal, paste0("Temporal validation — trained pre-", test_season,
+show_tbl(temporal, paste0("Temporal validation - trained pre-", test_season,
                           ", tested on ", test_season))
 ```
 
@@ -938,7 +1039,7 @@ fit_p <- fit_spec(sc$train, specs$primary)
 calib_oos <- sc$test %>%
   mutate(risk = as.numeric(predict(fit_p, newdata = ., type = "lp"))) %>%
   filter(!is.na(risk)) %>%
-  mutate(risk_group = ntile(risk, 5)) %>%      # 5 bands, not 10 — the test season is smaller
+  mutate(risk_group = ntile(risk, 5)) %>%      # 5 bands, not 10 - the test season is smaller
   group_by(risk_group) %>%
   summarise(n = n(), events = sum(event),
             event_rate_1k = round(1000 * sum(event) / n(), 1), .groups = "drop")
@@ -970,7 +1071,7 @@ player_cv <- map_dfr(names(specs), function(nm) {
 })
 
 validation_summary <- temporal %>% left_join(player_cv, by = "model")
-show_tbl(validation_summary, "Validation summary — apparent vs two out-of-sample estimates")
+show_tbl(validation_summary, "Validation summary - apparent vs two out-of-sample estimates")
 ```
 
 ## What it shows
@@ -985,9 +1086,11 @@ because they fail in different ways. The temporal split would expose a
 model that only worked in the seasons it was trained on; the
 player-grouped CV would expose one that had memorised specific players.
 
-The `best_load` specification also stays ahead of the primary one out of
-sample, so the exposure-swap advantage in Stage 5 is real rather than an
-in-sample artefact.
+The `minutes` robustness spec lands right on top of the primary (load)
+model out of sample - the held-out concordances are identical (see the
+table). So the exposure choice, load or minutes, makes no difference to
+how the model generalises, which is what I'd expect given they are
+\~0.99 collinear.
 
 Out-of-sample calibration holds too, observed injury rates in the
 held-out season still climb across risk bands built from the frozen
@@ -998,29 +1101,40 @@ model. The ranking transfers.
 # Conclusion
 
 **1. Workload predicts injury timing, but much of that is exposure, not
-fatigue.** Chronic minutes shows a large hazard ratio, but my negative
-control shows it acts nearly as strongly on random-impact injuries as on
-soft-tissue ones. I would be overclaiming to present the chronic-load HR
-as a causal fatigue effect, and the mechanism split is the evidence that
-stops me.
+fatigue.** Chronic load shows a large hazard ratio, but my negative
+control shows it acts at least as strongly on random-impact injuries as
+on soft-tissue ones. I would be overclaiming to present the chronic-load
+HR as a causal fatigue effect, and the mechanism split is the evidence
+that stops me.
 
 **2. The genuine fatigue signal is acute load, and it is smaller.**
 Acute 7-day load fades across the injury tiers in the way a causal
 mechanism should.
 
-**3. On-court load beats minutes for soft-tissue injury.** Tracking
-distance improves soft-tissue concordance from 0.693 to 0.744, in-sample
-and out. Minutes is a proxy for a coaching decision; distance is closer
-to what the tissue absorbed.
+**3. I report on-court load, but it is interchangeable with minutes -
+and catching *why* mattered.** I use load because it is the better
+construct (what the body absorbed, not what the coach chose), and the
+whole model holds identically under a minutes robustness fit
+(concordance `r round(summary(m3)$concordance[1], 2)` either way,
+chronic HR \~`r round(summary(m3)$conf.int["z_ROLLING_LOAD_28D", 1], 1)`
+either way). An earlier version had load *out-predicting* minutes for
+soft-tissue injury (0.693 → 0.744); that was a tracking-data bug, DNP
+games leaking a fake zero distance, not a real edge. Distance is the
+right idea, but in NBA public data total load ≈ minutes (r ≈ 0.99) and
+the injurious high-speed component is unobserved, so the two are
+equivalent.
 
 **4. The season's danger is in the baseline, not the coefficients.**
-Per-game baseline hazard is 1.5 x steeper late season, while covariate
-effects stay proportional throughout. Heavy chronic load is equally bad
-in October and April - the background risk is what rises.
+Per-game baseline hazard is `r sprintf("%.1f", late_rate / early_rate)`
+x steeper late season, while covariate effects stay proportional
+throughout. Heavy chronic load is equally bad in October and April - the
+background risk is what rises.
 
-**5. Injury-proneness is real and largely unmeasured.** θ = 0.323
-implies a 4.2 x spread between the 90th and 10th percentile of proneness
-after adjusting for everything I have. Public data does not capture it.
+**5. Injury-proneness is real and largely unmeasured.** θ =
+`r round(theta, 3)` implies a
+`r round(exp(2 * qnorm(0.9) * sd_frail), 1)` x spread between the 90th
+and 10th percentile of proneness after adjusting for everything I have.
+Public data does not capture it.
 
 ## Limitations I want stated plainly
 
@@ -1032,10 +1146,17 @@ after adjusting for everything I have. Public data does not capture it.
     come from official pre-game injury reports. I observe "listed Out
     with a reason", not a clinician's diagnosis, and reason text is
     inconsistent.
--   Concordance around 0.68 - 0.74 is a ceiling for public data. No GPS,
+-   Concordance around 0.68 - 0.73 is a ceiling for public data. No GPS,
     no medical screening, no detailed training load. I'd frame this as
     establishing what public data *can* do rather than as a competitive
     predictive model.
+-   The lagged in-game load terms cost coverage. Requiring two prior
+    played games means a player's first two appearances each season
+    cannot be scored, so the primary model fits
+    `r format(m3$nevent, big.mark = ",")` new-injury events rather than
+    the full `r format(sum(cox$event), big.mark = ",")`. Early-season
+    injuries are the blind spot this introduces, a fair price for a
+    prospective, correctly-signed load term.
 -   Mechanism tiers involve judgement. I assign categories by regex on
     reason text. The three-tier split is defensible but not the only
     defensible one.

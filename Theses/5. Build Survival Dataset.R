@@ -86,6 +86,8 @@ model_cols <- panel %>%
     ROLLING_GAMES_7D, ROLLING_GAMES_28D,
     # Workload — on-court external load (tracking distance)
     ROLLING_LOAD_7D, ROLLING_LOAD_28D, ACWR_LOAD,
+    # Workload — on-court intensity (load per minute; decorrelated from minutes)
+    INTENSITY, ROLLING_INTENSITY_7D, ROLLING_INTENSITY_28D,
 
     # Travel
     ROLLING_DIST_7D, ROLLING_DIST_14D, ROLLING_DIST_28D, ROLLING_DIST_42D,
@@ -135,6 +137,7 @@ locf_cols <- c(
   "SEASON_CUMULATIVE_MIN", "SEASON_CUMULATIVE_DIST",
   "ROLLING_GAMES_7D", "ROLLING_GAMES_28D",
   "ROLLING_LOAD_7D", "ROLLING_LOAD_28D", "ACWR_LOAD",   # on-court external load
+  "INTENSITY", "ROLLING_INTENSITY_7D", "ROLLING_INTENSITY_28D",   # on-court load per minute
   "ROLLING_B2B_7D", "ROLLING_B2B_28D",
   "ACWR_MIN", "ACWR_MIN_42", "ACWR_SPIKE",
   "IS_B2B", "IS_B2B_1ST", "IS_B2B_2ND", "SEASON_B2B_COUNT",
@@ -152,6 +155,45 @@ model_cols <- model_cols %>%
     all_of(intersect(locf_cols, names(.))),
     ~ zoo::na.locf(.x, na.rm = FALSE)
   )) %>%
+  ungroup()
+
+# ── 3b. Prospective (previous-played-game) versions of the in-game covariates ──
+# The in-game covariates (minutes, distance, intensity, box score) are realised
+# DURING a game, so using the CURRENT game's value on an interval means conditioning
+# on within-interval information, and it is timed inconsistently: a HEALTHY player at
+# a given risk time contributes their current game, but an INJURED player's row is
+# LOCF from their last played game (one game earlier). To make these covariates proper
+# (known before the interval starts) and consistently timed across healthy vs injured,
+# I add, for EVERY row, the value of the game the player most recently PLAYED strictly
+# BEFORE this one: PREV_GAME_* (the previous played game) and PREV_2GAME_* (two played
+# games back). I keep the current-game columns as well; which version the model uses is
+# decided in "6. Cox Modelling", not here.
+ingame_cols <- intersect(
+  c("MIN", "DISTANCE", "INTENSITY", "SPEED", "TOUCHES", "USAGEPERCENTAGE",
+    "POSSESSIONS", "PACE", "PTS", "REB", "AST", "TOV", "PLUS_MINUS"),
+  names(model_cols)
+)
+
+# The k-th most recent PLAYED value strictly before each row (k = 1 -> previous game,
+# k = 2 -> two games back). `before` = how many games the player has PLAYED before this
+# row, so I index straight into the ordered sequence of their played values.
+lag_played <- function(x, played, before, k) {
+  seq_vals <- x[played == 1L]
+  idx <- before - (k - 1L)
+  as.numeric(ifelse(idx >= 1L, seq_vals[pmax(idx, 1L)], NA_real_))
+}
+
+model_cols <- model_cols %>%
+  arrange(SEASON, PLAYER_ID, GAME_DATE) %>%
+  group_by(SEASON, PLAYER_ID) %>%
+  mutate(.played_before = lag(cumsum(PLAYED_FLAG), default = 0L)) %>%
+  mutate(across(
+    all_of(ingame_cols),
+    list(PREV_GAME  = ~ lag_played(.x, PLAYED_FLAG, .played_before, 1L),
+         PREV_2GAME = ~ lag_played(.x, PLAYED_FLAG, .played_before, 2L)),
+    .names = "{.fn}_{.col}"
+  )) %>%
+  select(-.played_before) %>%
   ungroup()
 
 # ── 4. Build the counting-process intervals ──
@@ -185,6 +227,11 @@ cox_data <- model_cols %>%
     event_soft   = as.integer(IS_NEW_INJURY == 1 & INJURY_MECHANISM == "soft_tissue"),
     event_load   = as.integer(IS_NEW_INJURY == 1 & INJURY_MECHANISM == "traumatic_load"),
     event_impact = as.integer(IS_NEW_INJURY == 1 & INJURY_MECHANISM == "random_impact"),
+    event_soft_load   = as.integer(IS_NEW_INJURY == 1 & (INJURY_MECHANISM == "traumatic_load" | INJURY_MECHANISM == "soft_tissue")),
+    event_soft_recurrent   = as.integer((IS_NEW_INJURY == 1 | IS_REAGGRAVATION == 1) & INJURY_MECHANISM == "soft_tissue"),
+    event_load_recurrent   = as.integer((IS_NEW_INJURY == 1 | IS_REAGGRAVATION == 1) & INJURY_MECHANISM == "traumatic_load"),
+    event_impact_recurrent = as.integer((IS_NEW_INJURY == 1 | IS_REAGGRAVATION == 1) & INJURY_MECHANISM == "random_impact"),
+    event_soft_load_recurrent = as.integer((IS_NEW_INJURY == 1 | IS_REAGGRAVATION == 1) & (INJURY_MECHANISM == "traumatic_load" | INJURY_MECHANISM == "soft_tissue")),
 
     INJURY_TIMELOSS_LAGGED = lag(INJURY_TIMELOSS, default = 0L),
     IN_RISK_SET = as.integer(INJURY_TIMELOSS_LAGGED != 1),

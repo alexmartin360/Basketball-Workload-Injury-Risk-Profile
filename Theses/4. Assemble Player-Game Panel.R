@@ -323,6 +323,20 @@ panel <- panel %>%
     by = c("PLAYER_ID", "GAME_ID")
   )
 
+# ── 3d.1 Tracking metrics are only real on games the player PLAYED ──
+# I found a nasty bug here. clean_game_load carries DNP rows with 0s — a player who
+# shows up in the tracking box score but didn't really play — and left-joining those
+# onto a missed game attaches DISTANCE = 0 (not NA). Downstream in file 5 the carry-
+# forward (LOCF) then PROPAGATES that 0 forward instead of the last real played value,
+# so injured players' rows end up with a fake ~0 distance. MIN dodges this because it's
+# always NA (never 0) on a missed game, so its carry-forward is clean. The fix: blank
+# the in-game tracking metrics on non-played rows so they're NA like MIN, and the
+# carry-forward uses the last game the player actually played.
+tracking_cols <- c("DISTANCE", "SPEED", "TOUCHES", "USAGEPERCENTAGE", "POSSESSIONS", "PACE")
+panel <- panel %>%
+  mutate(across(any_of(tracking_cols),
+                ~ if_else(PLAYED_FLAG == 1, as.numeric(.x), NA_real_)))
+
 # ── 3d.2 Rolling ON-COURT physical load (external load) ── built from tracking DISTANCE
 # My reasoning: minutes played is really a COACHING decision, so it's selection-biased.
 # The DISTANCE a player covers on court is closer to what their body actually absorbed
@@ -353,6 +367,24 @@ tracking_load <- panel %>%
 
 panel <- panel %>%                                              # attach the rolling-load features back
   left_join(tracking_load, by = c("SEASON", "PLAYER_ID", "GAME_ID"))
+
+# ── 3d.3 On-court INTENSITY (load per minute) ── the part of load that ISN'T volume.
+# I found that rolling DISTANCE and rolling MINUTES are ~0.99 collinear — a player's
+# distance is basically their minutes times a fairly steady rate — so rolling distance
+# on its own can't tell me anything minutes don't. What actually SEPARATES them is
+# intensity: distance covered PER minute, i.e. how hard they moved rather than how long.
+# I build it per game (DISTANCE / MIN) and as a trailing-window average (total distance
+# / total minutes over the window). The window version is decorrelated from minutes
+# (~ -0.27), so it lets me carry a genuine on-court-load signal alongside minutes as the
+# volume control, instead of a distance term that's just minutes in disguise.
+# I only trust the rolling ratio once there's a real base of minutes in the window
+# (>=30 in 7d, >=60 in 28d); below that the ratio is dividing tiny numbers and is noise.
+panel <- panel %>%
+  mutate(
+    INTENSITY = if_else(!is.na(MIN) & MIN > 0 & !is.na(DISTANCE), DISTANCE / MIN, NA_real_),
+    ROLLING_INTENSITY_7D  = if_else(ROLLING_MIN_7D  >= 30, ROLLING_LOAD_7D  / ROLLING_MIN_7D,  NA_real_),
+    ROLLING_INTENSITY_28D = if_else(ROLLING_MIN_28D >= 60, ROLLING_LOAD_28D / ROLLING_MIN_28D, NA_real_)
+  )
 
 # ── 3e. Career & bio context ── join player bio, career totals, preseason GP, derive age
 panel <- panel %>%
@@ -682,6 +714,8 @@ panel <- panel %>%
     ROLLING_GAMES_7D, ROLLING_GAMES_28D,
     # Workload — on-court external load (tracking distance)
     ROLLING_LOAD_7D, ROLLING_LOAD_28D, ACWR_LOAD,
+    # Workload — on-court intensity (load per minute; decorrelated from minutes)
+    INTENSITY, ROLLING_INTENSITY_7D, ROLLING_INTENSITY_28D,
     # Travel
     ROLLING_DIST_7D, ROLLING_DIST_14D, ROLLING_DIST_28D, ROLLING_DIST_42D,
     SEASON_CUMULATIVE_DIST, PLAYER_TRAVEL_KM,
