@@ -54,8 +54,3 @@ Theses/*.parquet
 
 # Scratch / notes exports (source lives in Theses/*.R)
 *.txt
-
-# knitr / R Markdown build artifacts (regenerate by knitting the .Rmd)
-*_cache/
-*_files/
-Theses/*.html
