@@ -5,8 +5,8 @@
 # into the counting-process format coxph() wants for time-varying covariates: one
 # interval per player-game, a start/stop time, an event flag, and every covariate
 # carried forward so no interval is missing its recent workload.
-# Input:   data_processed/panel_2021-26.rds  (the lean panel from file 4)
-# Output:  data_processed/cox_ready_2021-26.rds
+# Input:   data/processed/panel_2021-26.rds  (the lean panel from file 4)
+# Output:  data/processed/cox_ready_2021-26.rds
 #
 # The counting-process format I'm building
 # ----------------------------------------
@@ -28,7 +28,7 @@ library(tidyverse)
 library(lubridate)
 library(survival)
 
-BASE    <- "~/Library/Mobile Documents/com~apple~CloudDocs/Filing Cabinet/University/Latrobe/SPA-A/Project Code Base/Basketball-Workload-Injury-Risk-Profile/data_processed"
+BASE    <- here::here("data", "processed")   # repo-root/data/processed, portable
 OUT_DIR <- BASE
 
 message("=== Cox Model Preparation ===")

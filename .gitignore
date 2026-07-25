@@ -25,10 +25,6 @@ __pycache__/
 .env.*
 
 
-# Project docs & dependency manifest (kept local, not committed)
-README.md
-requirements.txt
-
 # IDE
 .vscode/*
 !.vscode/settings.json
@@ -39,21 +35,18 @@ requirements.txt
 logs/
 *.log
 
-# Generated / scraped data (rebuild with scripts)
-nba_injuries/
-nba_schedule/
-nba_player_travel/
-nba_player_tracking/
-nba_game_load/
-data_processed/
+# Generated / scraped data — everything lives under data/ (rebuild with the
+# python scrapers + R scripts 1-5). data/raw = scraped, data/processed = built.
+data/
 Archive/
 
 # Large local artifacts
 *.parquet
-Theses/*.parquet
 
-# Scratch / notes exports (source lives in Theses/*.R)
+# Scratch / notes exports (source lives in analysis/*.R)
 *.txt
+# ...but the Python dependency manifest is tracked
+!requirements.txt
 
 # knitr build intermediates (the knitted .html report IS tracked; these are not:
 # _cache/ holds large machine-specific model objects, _files/ holds figures the

@@ -11,10 +11,10 @@
 # I save two versions: a fat one with every column I built (handy for EDA) and a
 # lean one with just the modelling columns, which is what file 5 picks up.
 # Sources: 1. Injury Classification Rules.R
-# Input:   data_processed/clean_{sched,game_logs,rosters,player_bio,career,
+# Input:   data/processed/clean_{sched,game_logs,rosters,player_bio,career,
 #          game_load,injuries}.rds, preseason_participation.rds
-# Output:  data_processed/full_panel_2021-26.rds  (all columns, for EDA)
-#          data_processed/panel_2021-26.rds        (lean, for file 5)
+# Output:  data/processed/full_panel_2021-26.rds  (all columns, for EDA)
+#          data/processed/panel_2021-26.rds        (lean, for file 5)
 # =============================================================================
 
 library(tidyverse)
@@ -23,11 +23,10 @@ library(slider)
 
 SEASONS <- c("2021-22", "2022-23", "2023-24", "2024-25", "2025-26")
 
-BASE   <- '~/Library/Mobile Documents/com~apple~CloudDocs/Filing Cabinet/University/Latrobe/SPA-A/Project Code Base/Basketball-Workload-Injury-Risk-Profile/data_processed'
-BASE_T <- '~/Library/Mobile Documents/com~apple~CloudDocs/Filing Cabinet/University/Latrobe/SPA-A/Project Code Base/Basketball-Workload-Injury-Risk-Profile/Theses'
+BASE <- here::here("data", "processed")   # repo-root/data/processed, portable
 
 # Dictionary functions (injury_body_region etc.) + make this script self-contained
-source(file.path(BASE_T, "1. Injury Classification Rules.R"))
+source(here::here("analysis", "1. Injury Classification Rules.R"))
 
 clean_sched      <- read_rds(file.path(BASE, "clean_sched.rds"))
 clean_game_logs  <- read_rds(file.path(BASE, "clean_game_logs.rds"))

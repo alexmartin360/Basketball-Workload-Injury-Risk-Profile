@@ -50,8 +50,9 @@ from nba_api.stats.endpoints import (
 FIRST_SEASON           = "2015-16"
 PRESEASON_FIRST_SEASON = "2021-22"   # only fetch pre-season logs from here on
 
-OUTPUT_DIR = Path("nba_player_travel")
-OUTPUT_DIR.mkdir(exist_ok=True)
+ROOT_DIR   = Path(__file__).resolve().parent.parent   # repo root (parent of python/)
+OUTPUT_DIR = ROOT_DIR / "data" / "raw" / "nba_player_travel"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DELAY_MIN, DELAY_MAX = 1.0, 2.0
 INTER_SEASON_PAUSE   = 3

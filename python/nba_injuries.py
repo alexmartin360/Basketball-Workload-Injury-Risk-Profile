@@ -43,8 +43,9 @@ from nbainjuries import injury
 
 # --- Configuration -----------------------------------------------------------
 
-BASE_DIR    = Path("nba_injuries/injury_reports")
-MASTER_FILE = Path("nba_injuries/all_reports.parquet")
+ROOT_DIR    = Path(__file__).resolve().parent.parent   # repo root (parent of python/)
+BASE_DIR    = ROOT_DIR / "data" / "raw" / "nba_injuries" / "injury_reports"
+MASTER_FILE = ROOT_DIR / "data" / "raw" / "nba_injuries" / "all_reports.parquet"
 
 # Start of my 2021-22 modelling window. A fresh run back-fills from here.
 PROJECT_START = datetime(2021, 10, 1)

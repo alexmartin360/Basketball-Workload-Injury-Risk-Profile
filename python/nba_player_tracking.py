@@ -43,8 +43,9 @@ from nba_api.stats.endpoints import (
 # --- Configuration -----------------------------------------------------------
 
 FIRST_SEASON = "2016-17"
-OUTPUT_DIR   = Path("nba_game_load")
-OUTPUT_DIR.mkdir(exist_ok=True)
+ROOT_DIR     = Path(__file__).resolve().parent.parent   # repo root (parent of python/)
+OUTPUT_DIR   = ROOT_DIR / "data" / "raw" / "nba_game_load"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DELAY_MIN, DELAY_MAX = 0.5, 1.0    # polite pause between calls
 BATCH_SIZE, BATCH_PAUSE = 100, 5   # longer breather every 100 games

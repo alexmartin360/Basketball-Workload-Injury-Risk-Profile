@@ -8,8 +8,8 @@
 # rulebook, and flag whether it's a genuine injury absence.
 #
 # I pull the classification rules in from file 1 so I'm not duplicating them.
-# Input:   nba_injuries/injury_reports/*.parquet  (the 30-min pre-game filings)
-# Output:  data_processed/clean_injuries.rds
+# Input:   data/raw/nba_injuries/injury_reports/*.parquet  (the 30-min pre-game filings)
+# Output:  data/processed/clean_injuries.rds
 # =============================================================================
 
 library(tidyverse)
@@ -19,12 +19,12 @@ library(fs)
 # ── Config ──
 SEASONS <- c("2021-22", "2022-23", "2023-24", "2024-25", "2025-26")
 
-BASE_PATH   <- "/Users/alexmartin/Library/Mobile Documents/com~apple~CloudDocs/Filing Cabinet/University/Latrobe/SPA-A/Project Code Base/Basketball-Workload-Injury-Risk-Profile"
-BASE_PATH_T <- file.path(BASE_PATH, "Theses")
-OUT_DIR     <- file.path(BASE_PATH, "data_processed")
+# Paths anchor at the repo root via here:: (finds the .Rproj / .git marker), so the
+# project can live anywhere and be moved without editing a single path.
+OUT_DIR <- here::here("data", "processed")
 dir.create(OUT_DIR, showWarnings = FALSE)
 
-source(file.path(BASE_PATH_T, "1. Injury Classification Rules.R"))
+source(here::here("analysis", "1. Injury Classification Rules.R"))
 
 message("=== NBA Injury Report Cleaning ===")
 message("    Seasons: ", paste(SEASONS, collapse = ", "))
@@ -34,7 +34,7 @@ message("    Seasons: ", paste(SEASONS, collapse = ", "))
 # and stack them.
 message("\n[1] Loading injury report parquet files ...")
 
-injury_dir   <- file.path(BASE_PATH, "nba_injuries", "injury_reports")
+injury_dir   <- here::here("data", "raw", "nba_injuries", "injury_reports")
 injury_files <- fs::dir_ls(injury_dir, recurse = TRUE, glob = "*.parquet")
 message("  Found ", length(injury_files), " parquet files")
 

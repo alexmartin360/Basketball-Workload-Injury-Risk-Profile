@@ -1,0 +1,15 @@
+# Core data collection dependencies
+nba_api>=1.11.4
+nbainjuries>=1.1.1
+pandas>=2.3.3
+pyarrow>=23.0.1
+tqdm>=4.67.3
+
+# Web scraping (Archive scripts)
+beautifulsoup4>=4.14.3
+lxml>=6.0.2
+playwright>=1.58.0
+playwright-stealth>=2.0.2
+selenium>=4.41.0
+requests>=2.32.5
+python-dotenv>=1.2.2

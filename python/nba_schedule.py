@@ -39,8 +39,9 @@ from nba_api.stats.endpoints import scheduleleaguev2
 # --- Configuration -----------------------------------------------------------
 
 FIRST_SEASON = "2015-16"
-OUTPUT_DIR   = Path("nba_schedule")
-OUTPUT_DIR.mkdir(exist_ok=True)
+ROOT_DIR     = Path(__file__).resolve().parent.parent   # repo root (parent of python/)
+OUTPUT_DIR   = ROOT_DIR / "data" / "raw" / "nba_schedule"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DELAY_MIN, DELAY_MAX = 2.0, 4.0
 INTER_SEASON_PAUSE   = 6

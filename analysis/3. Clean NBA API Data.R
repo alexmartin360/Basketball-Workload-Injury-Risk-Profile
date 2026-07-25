@@ -7,9 +7,9 @@
 # way every season, derive the schedule-stress features I care about (rest days,
 # back-to-backs, road trips) and the lagged career context, then stack the seasons
 # into one clean file per dataset for the panel to pick up.
-# Input:   nba_schedule/*.csv, nba_player_travel/*.csv (game logs, rosters,
-#          player_bio, career stats), nba_game_load/*.parquet
-# Output:  data_processed/clean_{sched,game_logs,rosters,player_bio,career,game_load}.rds
+# Input:   data/raw/nba_schedule/*.csv, data/raw/nba_player_travel/*.csv (game logs,
+#          rosters, player_bio, career stats), data/raw/nba_game_load/*.parquet
+# Output:  data/processed/clean_{sched,game_logs,rosters,player_bio,career,game_load}.rds
 # =============================================================================
 
 library(tidyverse)
@@ -26,8 +26,9 @@ library(fs)
 # Career stats snapshots go back to 2015-16 for lagged career context.
 SEASONS <- c("2021-22", "2022-23", "2023-24", "2024-25", "2025-26")
 
-BASE_PATH <- "/Users/alexmartin/Library/Mobile Documents/com~apple~CloudDocs/Filing Cabinet/University/Latrobe/SPA-A/Project Code Base/Basketball-Workload-Injury-Risk-Profile"
-OUT_DIR   <- file.path(BASE_PATH, "data_processed")
+# Paths anchor at the repo root via here:: (finds the .Rproj / .git marker).
+RAW_DIR <- here::here("data", "raw")        # scraped inputs: data/raw/nba_*
+OUT_DIR <- here::here("data", "processed")  # built .rds outputs
 dir.create(OUT_DIR, showWarnings = FALSE)
 
 message("=== NBA Data Processing Pipeline ===")
@@ -126,7 +127,7 @@ for (SEASON in SEASONS) {
   
   # ── 2a. Schedule ── clean schedule, add road trips + opponent context
   raw_schedule <- read_season_csv(
-    file.path(BASE_PATH, "nba_schedule", paste0("nba_schedule_", SEASON, ".csv")),
+    file.path(RAW_DIR, "nba_schedule", paste0("nba_schedule_", SEASON, ".csv")),
     SEASON, "schedule"
   )
   
@@ -202,7 +203,7 @@ for (SEASON in SEASONS) {
   
   # ── 2b. Game logs ── clean player box scores, drop rank/fantasy noise
   raw_game_logs <- read_season_csv(
-    file.path(BASE_PATH, "nba_player_travel", paste0("game_logs_", SEASON, ".csv")),
+    file.path(RAW_DIR, "nba_player_travel", paste0("game_logs_", SEASON, ".csv")),
     SEASON, "game_logs"
   )
   
@@ -229,7 +230,7 @@ for (SEASON in SEASONS) {
   
   # ── 2c. Rosters ── clean season roster, de-duplicate player-team rows
   raw_rosters <- read_season_csv(
-    file.path(BASE_PATH, "nba_player_travel", paste0("rosters_", SEASON, ".csv")),
+    file.path(RAW_DIR, "nba_player_travel", paste0("rosters_", SEASON, ".csv")),
     SEASON, "rosters"
   )
   
@@ -249,7 +250,7 @@ for (SEASON in SEASONS) {
   
   # ── 2e. Career stats ── prior-season snapshot (lagged) + career totals per player
   raw_career <- read_season_csv(
-    file.path(BASE_PATH, "nba_player_travel",
+    file.path(RAW_DIR, "nba_player_travel",
               paste0("player_career_stats_", SEASON, ".csv")),
     SEASON, "career_stats"
   )
@@ -337,7 +338,7 @@ for (SEASON in SEASONS) {
   
   # ── 2g. Game load ── read in-game tracking metrics (Parquet)
   game_load_path <- file.path(
-    BASE_PATH, "nba_game_load",
+    RAW_DIR, "nba_game_load",
     paste0("nba_game_load_", SEASON, ".parquet")
   )
   
@@ -367,7 +368,7 @@ clean_game_load  <- bind_rows(game_load_list)
 
 # Player bio — single file, not season-specific
 clean_player_bio <- read_csv(
-  file.path(BASE_PATH, "nba_player_travel", "player_bio.csv"),
+  file.path(RAW_DIR, "nba_player_travel", "player_bio.csv"),
   show_col_types = FALSE
 ) %>%
   mutate(

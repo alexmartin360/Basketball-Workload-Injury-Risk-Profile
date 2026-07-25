@@ -3,6 +3,10 @@ title: "Workload, Schedule Congestion, and Injury Risk in the NBA"
 subtitle: "A Time-to-Event Perspective - Cox Modelling, Diagnostics and Validation"
 author: "Alex Martin - Master of Sports Analytics, La Trobe University"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
+# Knitting from RStudio renders the report into ../docs/ (the tracked copy).
+knit: (function(inputFile, encoding) rmarkdown::render(
+  inputFile, encoding = encoding,
+  output_dir = file.path(dirname(inputFile), "..", "docs")))
 output:
   html_document:
     theme: flatly
@@ -43,8 +47,9 @@ library(survival)
 library(broom)
 library(coxme)
 library(kableExtra)
+library(here)      # portable paths anchored at the repo root (.Rproj / .git)
 
-BASE <- "~/Library/Mobile Documents/com~apple~CloudDocs/Filing Cabinet/University/Latrobe/SPA-A/Project Code Base/Basketball-Workload-Injury-Risk-Profile/data_processed"
+BASE <- here("data", "processed")   # repo-root/data/processed, wherever the repo lives
 
 # One consistent table style for the whole document.
 show_tbl <- function(x, caption = NULL, digits = 3) {
