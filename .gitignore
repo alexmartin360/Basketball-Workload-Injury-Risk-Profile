@@ -54,3 +54,9 @@ Theses/*.parquet
 
 # Scratch / notes exports (source lives in Theses/*.R)
 *.txt
+
+# knitr build intermediates (the knitted .html report IS tracked; these are not:
+# _cache/ holds large machine-specific model objects, _files/ holds figures the
+# self-contained HTML already embeds)
+*_cache/
+*_files/
