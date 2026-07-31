@@ -57,3 +57,6 @@ Archive/
 # Work in progress: drafts, article plans and study notes kept local until they
 # are ready to publish (the knitted report in docs/ is the source of figures)
 docs/In Progress/
+
+# Office lock/temp files (Word writes these while a .docx or .pptx is open)
+~$*
