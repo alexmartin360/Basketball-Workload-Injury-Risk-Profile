@@ -233,9 +233,20 @@ cox_data <- model_cols %>%
     event_impact_recurrent = as.integer((IS_NEW_INJURY == 1 | IS_REAGGRAVATION == 1) & INJURY_MECHANISM == "random_impact"),
     event_soft_load_recurrent = as.integer((IS_NEW_INJURY == 1 | IS_REAGGRAVATION == 1) & (INJURY_MECHANISM == "traumatic_load" | INJURY_MECHANISM == "soft_tissue")),
 
+    # Who is in the risk set. I only want to remove rows where the player was ALREADY
+    # out when the interval opened AND is still out — i.e. the middle of an absence.
+    # Spelling it out for all four cases:
+    #   played / previous not absent  -> IN  (the normal row)
+    #   onset  / previous not absent  -> IN  (the event itself; this is why the lag exists)
+    #   absent / previous absent      -> OUT (mid-absence, genuinely not at risk)
+    #   played / previous absent      -> IN  (FIRST GAME BACK)
+    # That last case is the fix. The earlier rule was "previous row wasn't timeloss",
+    # which dropped the first game back as well - 4,690 played games, 3.6% of all
+    # appearances, and exactly the return-to-play games RECENT_RETURN is meant to
+    # measure. It removed exposure rather than events, but it removed the wrong ones.
     INJURY_TIMELOSS_LAGGED = lag(INJURY_TIMELOSS, default = 0L),
-    IN_RISK_SET = as.integer(INJURY_TIMELOSS_LAGGED != 1),
-    
+    IN_RISK_SET = as.integer(!(INJURY_TIMELOSS == 1 & INJURY_TIMELOSS_LAGGED == 1)),
+
     # Censored at the last in-risk-set row of the player-season if no event
     IS_CENSORED = as.integer(GAME_NUMBER == max(GAME_NUMBER[IN_RISK_SET == 1]) & event == 0)
   ) %>%
@@ -284,9 +295,15 @@ cox_data <- cox_data %>%
     CAREER_GAMES_MISSED = case_when(IS_ROOKIE == 1 ~ 0L, TRUE ~ CAREER_GAMES_MISSED),
     SEASONS_IN_LEAGUE = case_when(IS_ROOKIE == 1 ~ 1L, TRUE ~ SEASONS_IN_LEAGUE),
     
-    # Rookies have no prior season — zero is correct
-    PRIOR_SEASON_GP     = replace_na(PRIOR_SEASON_GP, 0),
-    PRIOR_SEASON_MIN_PG = replace_na(PRIOR_SEASON_MIN_PG, 0),
+    # Rookies genuinely have no prior season, so zero is the correct value for them.
+    # For a NON-rookie a missing prior season means something different: the record is
+    # absent (a season-long absence, G League, or overseas), NOT that they played zero
+    # minutes. Zero-filling those would mislabel returning players as deep bench and
+    # quietly drop them from any prior-season cohort filter, so they stay NA.
+    PRIOR_SEASON_GP     = if_else(IS_ROOKIE == 1, replace_na(PRIOR_SEASON_GP, 0),
+                                  PRIOR_SEASON_GP),
+    PRIOR_SEASON_MIN_PG = if_else(IS_ROOKIE == 1, replace_na(PRIOR_SEASON_MIN_PG, 0),
+                                  PRIOR_SEASON_MIN_PG),
   ) %>%
   
   # I cast the binary flags to a clean 0/1 integer. Two kinds of NaN I fill with 0,

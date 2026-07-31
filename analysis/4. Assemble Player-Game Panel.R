@@ -378,9 +378,20 @@ panel <- panel %>%                                              # attach the rol
 # volume control, instead of a distance term that's just minutes in disguise.
 # I only trust the rolling ratio once there's a real base of minutes in the window
 # (>=30 in 7d, >=60 in 28d); below that the ratio is dividing tiny numbers and is noise.
+# Same logic per game: a 2-minute garbage-time cameo divides distance by a tiny number
+# and returns a wild rate that isn't a meaningful "how hard he worked" measure. About
+# 16% of played games are under 10 minutes, so I require MIN >= 10 for a per-game
+# intensity value; below that it's left NA rather than allowed to inject noise.
+MIN_INTENSITY_MINUTES <- 10
 panel <- panel %>%
   mutate(
-    INTENSITY = if_else(!is.na(MIN) & MIN > 0 & !is.na(DISTANCE), DISTANCE / MIN, NA_real_),
+    # DISTANCE > 0 as well: 405 played games record exactly zero distance despite 10+
+    # minutes, which is physically impossible — it's the same tracking-feed failure that
+    # caused the DNP-zero bug above, so I treat those as missing rather than as a real
+    # rate of zero.
+    INTENSITY = if_else(!is.na(MIN) & MIN >= MIN_INTENSITY_MINUTES &
+                          !is.na(DISTANCE) & DISTANCE > 0,
+                        DISTANCE / MIN, NA_real_),
     ROLLING_INTENSITY_7D  = if_else(ROLLING_MIN_7D  >= 30, ROLLING_LOAD_7D  / ROLLING_MIN_7D,  NA_real_),
     ROLLING_INTENSITY_28D = if_else(ROLLING_MIN_28D >= 60, ROLLING_LOAD_28D / ROLLING_MIN_28D, NA_real_)
   )

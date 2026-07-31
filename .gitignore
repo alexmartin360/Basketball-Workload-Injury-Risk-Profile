@@ -53,3 +53,7 @@ Archive/
 # self-contained HTML already embeds)
 *_cache/
 *_files/
+
+# Work in progress: drafts, article plans and study notes kept local until they
+# are ready to publish (the knitted report in docs/ is the source of figures)
+docs/In Progress/
