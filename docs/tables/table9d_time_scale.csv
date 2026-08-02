@@ -1,0 +1,8 @@
+"Quantity","Scheduled-game clock","At-risk-interval clock"
+"Model 3: chronic load (28d)","2.126","2.189"
+"Model 3: acute load (7d)","1.306","1.271"
+"Model 3: acute:chronic ratio","1.187","1.195"
+"Model 3: concordance","0.6907","0.6924"
+"Soft-tissue: chronic / acute","1.975 / 1.343","2.011 / 1.322"
+"Load-linked: chronic / acute","2.334 / 1.478","2.442 / 1.39"
+"Random-impact: chronic / acute","2.24 / 1.038","2.334 / 1.015"
