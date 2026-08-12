@@ -1,6 +1,6 @@
-# =============================================================================
+
 # 2. Clean Injury Reports
-# =============================================================================
+
 # This is where I turn the raw scraped injury-report filings into one clean row
 # per player per game date. The NBA files a fresh report every 30 minutes before
 # tip-off, so for any given player-game I have several filings; my job here is to
@@ -10,7 +10,6 @@
 # I pull the classification rules in from file 1 so I'm not duplicating them.
 # Input:   data/raw/nba_injuries/injury_reports/*.parquet  (the 30-min pre-game filings)
 # Output:  data/processed/clean_injuries.rds
-# =============================================================================
 
 library(tidyverse)
 library(arrow)

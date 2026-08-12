@@ -51,6 +51,13 @@ library(here)      # portable paths anchored at the repo root (.Rproj / .git)
 
 BASE <- here("data", "processed")   # repo-root/data/processed, wherever the repo lives
 
+# The injury rulebook, so the classification helpers (injury_severity_ioc etc.) are
+# the exact same ones the data was built with rather than a second copy.
+source(here("analysis", "1. Injury Classification Rules.R"))
+
+# Must match the value used when the panel was built in file 4.
+RETURN_DURABILITY_GAMES <- 8
+
 # One consistent table style for the whole document.
 show_tbl <- function(x, caption = NULL, digits = 3) {
   kbl(x, caption = caption, digits = digits) %>%
@@ -74,21 +81,6 @@ fmt_p <- function(p) {
 }
 ```
 
-# What this document is {.unnumbered}
-
-This is the modelling half of my thesis, run end to end in one place.
-Scripts 1-5 build the data; everything from here on fits, diagnoses and
-validates the models. I moved it out of the numbered R files and into R
-Markdown so that the reasoning, the code and the output sit next to each
-other, when I write the thesis I want to be reading my own justification
-alongside the number it produced, not flipping between a script and a
-console log.
-
-Does an NBA player's recent workload and schedule congestion carry
-signal that assist in indicating when a player is at elevated risk of
-being injured, and how much of any such signal is real physiology versus
-an artefact of who is fit enough to be playing in the first place?
-
 ::: {.alert .alert-info}
 Every model here is re-fitted from `cox_ready_2021-26.rds` when this
 document knits, nothing is read back from a saved model object. Chunks
@@ -98,56 +90,164 @@ cross-validation folds dominate).
 
 ------------------------------------------------------------------------
 
-# The modelling dataset
+# Stage 0 - The modelling dataset {#stage0}
+
+Feeds article 2.1, 2.3 and Table 1.
 
 ```{r load-data}
 cox <- readRDS(file.path(BASE, "cox_ready_2021-26.rds"))
 
+# The overuse tier is sub-divided the way Stage 6 reports it, so the reader meets the
+# diagnosed / symptom-only counts here rather than for the first time in the results.
+.named <- !cox$INJURY_TISSUE %in% c("non_specific", "not_recorded")
+.n_diag  <- sum(cox$event_repetitive == 1 &  .named)
+.n_sympt <- sum(cox$event_repetitive == 1 & !.named)
+.n_unclass <- sum(cox$event) - sum(cox$event_repetitive) -
+              sum(cox$event_acute_nc) - sum(cox$event_acute_imp)
+f <- function(x) format(x, big.mark = ",")
+
 data_summary <- tibble(
   Quantity = c("Player-game intervals (rows)", "Distinct players", "Seasons",
                "New-injury events (primary outcome)",
-               "  - soft-tissue", "  - load-linked structural", "  - random-impact",
+               "  - overuse (repetitive mechanism)",
+               "      of which: pathology named", "      of which: symptom only",
+               "  - acute non-contact", "  - acute impact (negative control)",
+               "  - mechanism not classifiable",
                "All-injury events (new + reaggravation)",
-               "  - soft-tissue", "  - load-linked structural", "  - random-impact"),
+               "  - overuse (repetitive mechanism)", "  - acute non-contact",
+               "  - acute impact (negative control)"),
   Value = c(
-    format(nrow(cox), big.mark = ","),
-    format(n_distinct(cox$PLAYER_ID), big.mark = ","),
+    f(nrow(cox)), f(n_distinct(cox$PLAYER_ID)),
     sprintf("%d (%s to %s)", n_distinct(cox$SEASON), min(cox$SEASON), max(cox$SEASON)),
-    format(sum(cox$event), big.mark = ","),
-    format(sum(cox$event_soft), big.mark = ","),
-    format(sum(cox$event_load), big.mark = ","),
-    format(sum(cox$event_impact), big.mark = ","),
-    format(sum(cox$event_recurrent), big.mark = ","),
-    format(sum(cox$event_soft_recurrent), big.mark = ","),
-    format(sum(cox$event_load_recurrent), big.mark = ","),
-    format(sum(cox$event_impact_recurrent), big.mark = ",")
+    f(sum(cox$event)),
+    f(sum(cox$event_repetitive)), f(.n_diag), f(.n_sympt),
+    f(sum(cox$event_acute_nc)), f(sum(cox$event_acute_imp)), f(.n_unclass),
+    f(sum(cox$event_recurrent)),
+    f(sum(cox$event_repetitive_recurrent)),
+    f(sum(cox$event_acute_nc_recurrent)),
+    f(sum(cox$event_acute_imp_recurrent))
   )
 )
 show_tbl(data_summary, "The counting-process dataset")
 ```
 
 Each row is one player-game interval `(t_start, t_stop]` with an event
-indicator. The clock is **game number within a season**, and a player
-only contributes rows while they are genuinely *at risk*, once an injury
-starts, the remaining missed games are removed and they re-enter when
-they play again. Otherwise I would be counting a player as "surviving"
-games they were never available for.
+indicator. The clock is game number within a season, and a player only
+contributes rows while genuinely at risk: once an injury starts the
+remaining missed games are removed, and they re-enter when they play
+again.
 
-I have 3,257 new-injury events across 1,029 players. Large enough that
-**p-values stop being informative on their own**, which is a theme I
-return to repeatedly below. At this sample size a trivially small effect
-will still return p \< 0.001, so throughout I read effect size first and
-significance second.
+`r format(sum(cox$event), big.mark = ",")` new-injury events across
+`r format(n_distinct(cox$PLAYER_ID), big.mark = ",")` players. That is
+large enough that p-values stop being informative on their own, so
+throughout I read effect size first and significance second.
+
+The mechanism tiers do not quite sum to that total: `r .n_unclass`
+episodes carry no classifiable mechanism, because every report filed for
+them was management text with no pathology in it. They stay in the
+primary outcome, since they are genuine injuries, and drop out only of
+the tier-specific models in Stage 6.
+
+## How I classify injuries
+
+Following the IOC consensus statement (Bahr et al. 2020), which
+recommends recording body region, tissue type, mechanism and severity
+independently rather than as one label. The NBA reports support this
+better than I expected: they are written as
+`Injury/Illness - <SITE>; <PATHOLOGY>`, so site and pathology are
+already separate fields, and about nine in ten carry a side.
+
+```{r injury-taxonomy}
+ep <- cox %>% filter(IS_NEW_INJURY == 1 | IS_REAGGRAVATION == 1)
+
+# A team's schedule density, so I can express the durability window in weeks.
+team_games_per_week <- cox %>% distinct(SEASON, TEAM_ID, GAME_DATE) %>%
+  group_by(SEASON, TEAM_ID) %>%
+  summarise(g = n(), span = as.numeric(max(GAME_DATE) - min(GAME_DATE)), .groups = "drop") %>%
+  summarise(gpw = 7 * sum(g) / sum(span)) %>% pull(gpw)
+
+tax_tab <- bind_rows(
+  ep %>% count(Level = "Body region (IOC)", Value = INJURY_REGION),
+  ep %>% count(Level = "Tissue type (IOC)", Value = INJURY_TISSUE),
+  ep %>% count(Level = "Mechanism (IOC)",   Value = INJURY_MECHANISM_IOC),
+  ep %>% count(Level = "Side",              Value = INJURY_SIDE)) %>%
+  group_by(Level) %>% slice_max(n, n = 6) %>%
+  mutate(`%` = round(100 * n / sum(n))) %>% ungroup()
+show_tbl(tax_tab, "Injury classification levels (top categories per axis, episode starts)")
+
+# Severity, in the IOC's time-loss bands. 
+sev_tab <- readRDS(file.path(BASE, "panel_2021-26.rds")) %>%
+  filter(INJURY_TIMELOSS == 1, !is.na(INJURY_EPISODE_ID)) %>%
+  count(SEASON, PLAYER_ID, INJURY_EPISODE_ID, name = "games_missed") %>%
+  mutate(Severity = factor(injury_severity_ioc(games_missed),
+                           levels = c("minimal (1-7 days)", "moderate (8-28 days)",
+                                      "severe (>28 days)"))) %>%
+  count(Severity) %>% mutate(`%` = round(100 * n / sum(n)))
+show_tbl(sev_tab, "Severity of injury episodes, IOC time-loss bands")
+```
+
+Severity is reported, not modelled. I record it because the IOC asks for
+it and because it describes the cohort honestly, but my outcome is the
+onset of an injury, so severity is a property of what follows the event
+rather than a predictor of it. Modelling severity would be a different
+study with a different risk set.
+
+Area of opportunity for building into the future building a dynamic
+aggregation window based on injury severity.
+
+## Defining a subsequent injury
+
+The second half of the outcome definition is deciding when a later
+absence is a new injury and when it is the old one flaring up. IOC,
+distinguishes an exacerbation (same site, before recovery) from a
+recurrence (same site, after the athlete has returned to full
+availability).
+
+"Full availability" is a clinical judgement: being off the injury report
+does not mean the medical staff consider a player recovered, and I
+observe nothing about training, rehabilitation or minutes restrictions.
+So rather than assert a recovery status I do not have, I use the two
+things I can observe.
+
+First, the classification of each subsequent injury relative to the one
+before it, using the data-driven level of the SIC-2.0 model (Toohey et
+al. 2018, extending Finch and Cook 2014). SIC-2.0 exists precisely for
+datasets without clinical input: its data-driven categories are defined
+on site, nature and side alone, and the "related / unrelated" judgements
+sit in a separate clinical tier which I leave unpopulated.
+
+Second, a return-durability rule in place of a recovery judgement. What
+I am counting is new episodes, and a genuine re-injury is a new episode
+provided the player got back to playing properly first. So this rule
+does not merge every repeat. It merges only the ones that arrive before
+a player has re-established himself, which are the ones most likely to
+be the original problem never having resolved. A repeat at the same site
+(region and side) counts as the earlier episode flaring up if the player
+managed fewer than `r RETURN_DURABILITY_GAMES` games in between;
+anything after that is counted as a new episode in its own right. That
+is also how the epidemiology consensus treats recurrence: Fuller et al.
+(2006) classify a same-site injury after return to play as a recurrent
+injury, not as a continuation.
+
+```{r sic-table}
+sic_tab <- cox %>% filter(!is.na(SIC_CATEGORY)) %>%
+  count(`SIC-2.0 category` = SIC_CATEGORY, sort = TRUE) %>%
+  mutate(`%` = round(100 * n / sum(n), 1))
+show_tbl(sic_tab, "Subsequent injuries by SIC-2.0 data-driven category")
+```
+
+Roughly one episode in five is a repeat at the same site with the same
+tissue type, the category closest to a classical recurrence, and that is
+before any clinical judgement about relatedness. It is the clearest
+single number I have for why the recurrent-events models in Stage 4 are
+worth fitting at all.
 
 ## What the risk set actually looks like
 
-The at-risk rules are the hardest part of this design to describe in
-prose, so here they are drawn. I take LeBron James in 2025-26, because
-that one player-season happens to contain every case: a season-opening
-absence, a mid-season rest day, a region change during an absence, and
-five injury onsets. This reads directly off `panel_2021-26.rds`, before
-the risk-set filter in file 5, so the rows that get removed are still
-visible.
+LeBron James in 2025-26 happens to contain every case: a season-opening
+absence, a mid-season rest day, a region change mid-absence, and five
+onsets. Read off `panel_2021-26.rds`, before the file-5 filter, so the
+removed rows are still visible.
 
 ```{r risk-set-schematic, fig.height=4.6, fig.width=10}
 lb <- readRDS(file.path(BASE, "panel_2021-26.rds")) %>%
@@ -156,7 +256,7 @@ lb <- readRDS(file.path(BASE, "panel_2021-26.rds")) %>%
   mutate(
     g      = row_number(),
     tl     = coalesce(INJURY_TIMELOSS, 0L),
-    tl_lag = lag(tl, default = 0L),
+    tl_lag = dplyr::lag(tl, default = 0L),
     onset  = as.integer(coalesce(IS_NEW_INJURY, 0L) == 1 | coalesce(IS_REAGGRAVATION, 0L) == 1),
     pre1st = as.integer(cumsum(coalesce(PLAYED_FLAG, 0L)) == 0),   # left truncation
     # The file-5 rule: out only if already absent when the interval opened AND still absent.
@@ -213,50 +313,35 @@ fig_riskset <- ggplot() +
 fig_riskset
 ```
 
-Eighty-two scheduled games become **`r sum(lb$in_risk)`** modelled
-intervals and
-**`r sum(lb$state == "Injury onset: event, retained in risk set")`**
+Eighty-two scheduled games become `r sum(lb$in_risk)` modelled intervals
+and `r sum(lb$state == "Injury onset: event, retained in risk set")`
 retained events out of the seven onsets in the season. Three things are
 worth reading off it.
 
-The **rest day at game 53 stays in the risk set**. That is the case most
-easily got wrong: a rested player can still be injured tomorrow, so
-dropping them would delete exactly the low-load intervals that identify a
-workload effect.
+The rest day at game 53 stays in the risk set. A rested player can still
+be injured tomorrow, so dropping them would delete exactly the low-load
+intervals that identify a workload effect.
 
-**Game 15 is the first game back**, and it stays in the risk set too.
-That one is here because it did not, until I drew this figure. The
-original rule was "the previous row was not a time-loss row", which keeps
-the onset and removes the absence correctly, but also silently removed
-the first appearance *after* every absence. Across the panel that was
-4,690 played games, 3.6% of all appearances, and precisely the
-return-to-play games `RECENT_RETURN` exists to measure. It cost exposure
-rather than events, so no event count was ever wrong, but it removed the
-wrong rows. The rule is now
-`!(INJURY_TIMELOSS == 1 & INJURY_TIMELOSS_LAGGED == 1)`, which keeps
-onsets, keeps returns, and removes only the middle of an absence.
-
-Two onsets are still lost, for different reasons, and both are honest
-costs of the design rather than defects. The season-opening back injury
-precedes any appearance, so it falls in the left-truncated window. The
-onset at game 65 fires while the player is still absent with a different
-injury, so the risk-set filter takes it along with the absence around it.
-That second case is the one file 5 counts and reports on every run.
+Two onsets are still lost and both are design costs rather than defects.
+The season-opening injury precedes any appearance, so it is
+left-truncated. The game-65 onset fires mid-absence with a different
+injury, so the filter takes it with the absence around it. File 5 counts
+that loss on every run.
 
 ------------------------------------------------------------------------
 
-# Stage 0 - Covariate screening
+# Stage 1 - Covariate screening {#stage1}
 
-Cox models are unstable when two covariates carry nearly the same
-information, coefficients effects get split between them, standard
-errors inflate, and signs can flip. I have several rolling windows of
-the same underlying quantity (7-day, 28-day and 42-day minutes, for
-instance). I screen for it *before* fitting, rather than fitting first
-and rationalising afterwards.
+Feeds article 2.4 and Appendix A.4.
 
-I use **Spearman** rather than Pearson because these workload
-distributions are skewed and I care about monotone redundancy, not
-linear redundancy.
+Near-duplicate covariates destabilise a Cox model: effects split between
+them, standard errors inflate, signs flip. I have several rolling
+windows of the same quantity, so I screen before fitting rather than
+rationalising afterwards.
+
+I use Spearman rather than Pearson because these workload distributions
+are skewed (not linear) and I care about monotone redundancy, not linear
+redundancy.
 
 ```{r stage0-screening}
 candidates <- c(
@@ -287,71 +372,66 @@ show_tbl(collinear, "Collinear pairs (|Spearman r| > 0.8) - only one of each ent
 
 ## What it shows
 
-23 pairs breach the 0.8 threshold, and they cluster into a few obvious
+The pairs that breach the 0.8 threshold, cluster into a few obvious
 families: the overlapping minutes windows, the career-length variables,
-and the in-game effort measures. For each I keep **one** on
-interpretability grounds rather than statistical ones:
+and the in-game effort measures. For each I keep one on interpretability
+grounds rather than statistical ones:
 
--   `SEASONS_IN_LEAGUE` (with a quadratic term) over age and draft year:
-    tenure is the construct that carries the *institutional* differences
-    in how players are worked, and those differences are not linear.
-    Under the NBA's **Player Participation Policy (2023)**, teams can
-    obtain pre-approved back-to-back rest for players who are 35 or older
-    on opening night, or who have accumulated roughly 34,000 regular-season
-    minutes or 1,000 career games, or who carry a serious injury history.
-    Younger players get no such allowance. So veterans are, by rule as
-    well as by convention, rested more and practise less (their acute loads are systematically
-    lower), while the same veterans carry the
-    most accumulated mileage. Those two forces pull in opposite
-    directions across a career, which is exactly the shape a quadratic
-    captures and a straight line cannot. The empirical literature agrees
-    that the relationship is not a simple line: early NBA epidemiology
-    found no clean linear age-injury association (Drakos et al. 2010),
-    while more recent work finds older players suffer disproportionately
-    under schedule compression (Morikawa et al. 2022), and rookie-season
-    injury predicts career longevity at the other end (Martin et al.
-    2021). I therefore fit tenure and tenure-squared rather than assume
-    monotonicity.
--   `ROLLING_MIN_28D` over the 42-day window: 28 days is the
-    conventional chronic window in the ACWR literature, so it keeps my
-    results comparable to prior work.
+-   `SEASONS_IN_LEAGUE` with a quadratic term over age and draft year.
+    Tenure carries the institutional differences in how players are
+    worked, and those are not linear. The Player Participation Policy
+    (2023) lets teams pre-approve back-to-back rest for older or
+           high-mileage star players, so veterans are rested more by
+           rule while carrying the most accumulated mileage. Two forces
+           in opposite directions, which is a quadratic, not a line.
+           Drakos (2010), Morikawa
+    (2024) and Martin (2021) all point away from monotonicity.
+-   `ROLLING_MIN_28D` over the 42-day window: 28 days is the ACWR
+    convention, so results stay comparable.
 -   `MIN` for in-game effort.
 
-Two specific exclusions worth recording, because both were judgement
-calls:
+`ROLLING_GAMES_28D` dropped (r =
+`r round(cor_mat["ROLLING_GAMES_28D", "ROLLING_MIN_28D"], 2)` with
+chronic minutes), `ROLLING_GAMES_7D` kept (correlation under 0.8, and it
+separates frequency from volume, since four games in a week is a
+different from the same minutes across two).
 
--   **`ROLLING_GAMES_28D` is dropped** (r = 0.86 with chronic minutes).
-    It was redundant *and* null when fitted, so nothing is lost.
--   **`ROLLING_GAMES_7D` is kept.** Its correlation with 7-day minutes
-    sits under 0.8, and it separates *frequency* from *volume*, playing
-    four games in a week is a different stimulus from playing the same
-    minutes across two.
+-   **Neither ACWR term survives to the model.** `ACWR_LOAD` and
+    `ACWR_MIN` are screened here because the acute:chronic ratio is the
+    field's most cited workload construct and leaving it untested would
+    be a gap. The correlation table already shows the two versions of it
+    are the same variable (r =
+    `r round(cor_mat["ACWR_MIN", "ACWR_LOAD"], 3)`), but the reason
+    neither enters is not collinearity with each other - it is that ACWR
+    is a deterministic function of the acute and chronic terms the model
+    carries separately. I set out that argument where the specification
+    is fixed, in Stage 2.
 
 ------------------------------------------------------------------------
 
-# Stage 1 - Nested models
+# Stage 2 - Nested models {#stage2}
 
-My hypothesis is ordered, so the model build is ordered too. I add
-covariates in three **domain blocks**, workload, then schedule
+Feeds article 2.5, 3.1, 3.2, 3.8 and Appendix B.2.
+
+I add covariates in three domain blocks, workload, then schedule
 congestion, then player context, and ask at each, whether the new domain
-earns its place. That structure answers "which domain matters", rather
-than producing one flat model where I'd be picking through 24
-individually significant coefficients.
+earns its place. Answering "which domain matters", rather than producing
+one flat model where I'd be picking through 24 individually significant
+coefficients.
 
 Three specification choices carry the design, and each is a deliberate
 answer to a feature of this data:
 
 | Choice | Why it is there |
 |----|----|
-| `Surv(t_start, t_stop, event)` | Counting-process form, so covariates can change every game. injured this season y/n model would collapse the season to one outcome and be blind to *when* risk moves. |
-| `strata(SEASON)` | Each season gets its own baseline hazard. The COVID-adjacent seasons had a genuinely different shape, and I don't want that contaminating the covariate effects. I assume workload *acts* the same way each season, not that each season is equally dangerous. |
+| `Surv(t_start, t_stop, event)` | Counting-process form, so covariates can change every game. injured this season y/n model would collapse the season to one outcome and be blind to when risk moves. |
+| `strata(SEASON)` | Each season gets its own baseline hazard. The COVID-adjacent seasons had a genuinely different shape, and I don't want that contaminating the covariate effects. I assume workload acts the same way each season, not that each season is equally dangerous. |
 | `cluster(PLAYER_ID)` | LeBron contributes \~332 rows that are one repeatedly-observed person, not 332 independent facts. Without this the standard errors are far too narrow. |
 
-I also **z-score every continuous covariate**, so each hazard ratio
-reads as "per 1 standard deviation increase". That is what makes it
-legitimate to say chronic load matters more than travel, otherwise I'd
-be comparing an effect measured in minutes against one measured in
-kilometres.
+I also z-score every continuous covariate, so each hazard ratio reads as
+"per 1 standard deviation increase". That is what makes it legitimate to
+say chronic load matters more than travel, otherwise I'd be comparing an
+effect measured in minutes against one measured in kilometres.
 
 ```{r zscore}
 z <- function(x) as.numeric(scale(x))
@@ -366,14 +446,8 @@ cox <- cox %>%
     z_MIN              = z(MIN),
     z_PREV_GAME_MIN    = z(PREV_GAME_MIN),   
     z_PREV_2GAME_MIN   = z(PREV_2GAME_MIN), 
-    # In-game intensity (distance per minute): LAG versions only, matching the
-    # distance/minutes in-game treatment. Rolling and contemporaneous intensity were
-    # tested and dropped: both rolling windows were null (7d p=0.92, 28d p=0.16) and
-    # the current-game term is not prospective. The lag pair is orthogonal to load
-    # (|r| <= 0.06) and jointly significant, so it earns a place as its own construct.
     z_PREV_GAME_INTENSITY    = z(PREV_GAME_INTENSITY),
     z_PREV_2GAME_INTENSITY   = z(PREV_2GAME_INTENSITY),
-    # Workload - on-court tracking load (used in Stage 5)
     z_ROLLING_LOAD_7D  = z(ROLLING_LOAD_7D),
     z_ROLLING_LOAD_28D = z(ROLLING_LOAD_28D),
     z_ACWR_LOAD        = z(ACWR_LOAD),
@@ -397,6 +471,13 @@ cox <- cox %>%
     z_HEIGHT_INCHES         = z(HEIGHT_INCHES),
     z_WEIGHT                = z(WEIGHT)
   )
+
+# Two collinearity figures the prose quotes, computed here so they cannot go stale.
+r_load_min <- cor(cox$ROLLING_LOAD_28D, cox$ROLLING_MIN_28D, use = "pairwise.complete.obs")
+r_int_load <- max(abs(cor(
+  cox[c("PREV_GAME_INTENSITY", "PREV_2GAME_INTENSITY")],
+  cox[c("ROLLING_LOAD_7D", "ROLLING_LOAD_28D", "PREV_GAME_DISTANCE", "PREV_2GAME_DISTANCE")],
+  use = "pairwise.complete.obs")))
 ```
 
 ```{r model-specs, dependson="zscore"}
@@ -409,15 +490,9 @@ fit_cox <- function(covariate_terms, lhs = surv_lhs) {
   coxph(f, data = cox, ties = "efron")
 }
 
-# Workload block - ON-COURT LOAD (tracking distance). I use load rather than minutes
-# as my exposure: distance covered is what the body actually absorbed, the sports-
-# science "external load", whereas minutes is a coaching decision. Load and minutes
-# are ~0.995 collinear here, so this doesn't change discrimination - I verify that
-# with a minutes robustness fit below - it just puts the better construct in front.
 m1_terms <- c(
   "z_ROLLING_LOAD_7D",         # acute on-court load (distance)
   "z_ROLLING_LOAD_28D",        # chronic on-court load (distance)
-  "z_ACWR_LOAD",               # acute:chronic load ratio
   "z_ROLLING_GAMES_7D",        # acute games played (frequency)
   "z_ROLLING_DIST_7D",         # acute travel load
   "z_ROLLING_DIST_28D",        # chronic travel load
@@ -426,10 +501,6 @@ m1_terms <- c(
   "z_PREV_2GAME_DISTANCE"      # in-game load, 2 games back (lag-2, prospective fatigue spike)
 )
 
-# Intensity (distance per minute) is NOT in the primary model. It is a rate rather than
-# a volume, and once volume is controlled it adds nothing. I show that explicitly in the
-# intensity robustness fit below, and keep the terms out of Model 3 so the primary model
-# doesn't pay intensity's extra missingness (it needs >=10 minutes to be defined).
 intensity_terms <- c("z_PREV_GAME_INTENSITY", "z_PREV_2GAME_INTENSITY")
 
 schedule_added <- c(
@@ -449,57 +520,73 @@ context_added <- c(
 m2_terms <- c(m1_terms, schedule_added)
 m3_terms <- c(m2_terms, context_added)
 
-# The minutes-based counterpart of the full Model 3, kept only for the robustness
-# check: same specification with minutes swapped in for load - including the same lag-1
-# + lag-2 treatment of the in-game term, so the specs differ ONLY in the volume swap.
-m3_terms_min <- c("z_ROLLING_MIN_7D", "z_ROLLING_MIN_28D", "z_ACWR_MIN",
+m3_terms_min <- c("z_ROLLING_MIN_7D", "z_ROLLING_MIN_28D",
                   "z_ROLLING_GAMES_7D", "z_ROLLING_DIST_7D", "z_ROLLING_DIST_28D",
                   "z_SEASON_CUMULATIVE_DIST", "z_PREV_GAME_MIN", "z_PREV_2GAME_MIN",
                   schedule_added, context_added)
 ```
 
-**A note on the in-game load term.** Rather than the current game's
-distance, I use two lagged versions: the last game played
-(`PREV_GAME_DISTANCE`, lag-1) and two games back (`PREV_2GAME_DISTANCE`,
-lag-2). The current game's distance is contemporaneous with the injury
-and reverse-caused (a player who breaks down logs a low distance in the
-game it happens) so it reads protective for the wrong reason. Both lags
-are known before the interval opens, so they are genuinely prospective,
-and they separate two signals: the last game carries the load-management
-pattern (the game before a breakdown is often a managed, compromised
-one, so lag-1 reads protective), while two games back sits before that
-compromise and reads as the harmful fatigue spike a real overuse
-mechanism should produce.
+### What the acute and chronic load terms actually mean together
 
-*I validated that lag-2 survives out-of-sample and is not just
-re-expressing the rolling load (VIF ≈ 3) before adopting it. The
-trade-off is coverage, a player's first two games each season have no
-lag-2 and drop from these models.*
+This is worth being precise about, because the two windows overlap and
+that changes how the acute coefficient should be read. The 7-day window
+sits inside the 28-day window: last week's load is also part of last
+month's load. So the acute coefficient is not "the effect of playing a
+lot last week". Holding the 28-day total fixed, it is the effect of the
+same month's work being concentrated into the last week rather than
+spread evenly across the four.
 
-**A note on in-game intensity.** Intensity (distance per minute) is the
-*rate* the body worked, as opposed to the *volume* that load and minutes
-measure, and it is close to orthogonal to load here (\|r\| ≤ 0.06), so
-it is a genuinely separate construct, not a re-labelled one. It is
-**not** in the primary model. I tested it and report the result as a
-robustness finding below: once volume is accounted for, intensity adds
-nothing. Two practical reasons reinforce keeping it out. First, a
-per-game rate is only meaningful with a real base of minutes: a
-two-minute garbage-time cameo divides distance by a tiny number and
-returns a wild rate, so I require at least 10 minutes for an intensity
-value, which makes the term *more* missing than the load terms and would
-cost the primary model sample for no gain. Second, the rolling windows
-(7d and 28d) were flatly null. Intensity is still carried the same
-prospective way as everything else (lag-1 and lag-2, no contemporaneous
-version) so that the robustness test is a fair one.
+A worked example. Two players arrive at tonight's game having each
+covered 40 km over the past month, so their chronic load is identical
+and the model holds it equal:
 
-A note on the schedule block, I included **both** the accumulated
-congestion dose (rolling back-to-back counts, road-trip game number)
-**and** the point-in-time flags (`IS_B2B`, `IS_PLAYER_ROAD_TRIP`). The
-accumulated versions are the exposure measure. The point-in-time flags
-are contaminated by coaching decisions, because a coach rests an at-risk
-player tonight. I keep them in so the contrast is visible in the results
-table rather than hidden by dropping them, and I mark them as
-selection-biased everywhere they appear.
+-   Player A covered 10 km in each of the four weeks. Steady.
+-   Player B covered 4 km in each of the first three weeks and 28 km
+    last week. Same month, front-loaded.
+
+They are indistinguishable on chronic load. They differ only on acute
+load, and the acute coefficient is exactly the comparison of B against
+A: same total work, but crammed into the days immediately before
+tonight. That is what fatigue means physiologically, so this contrast is
+the fatigue construct rather than a volume measure.
+
+It also explains why the chronic term has to stay in. Fitted on its own,
+acute load simply proxies for how much a player plays, and it then
+predicts contact injuries just as happily as overuse ones, because busy
+players collect more of everything. Conditioning on chronic strips the
+volume out and leaves the concentration, which is the part fatigue can
+speak to. I show that directly in the appendix.
+
+I do not include an acute:chronic workload ratio. ACWR is by
+construction a function of the two terms already in the model (weekly
+acute over weekly-average chronic), so adding it puts the same
+information in three times, and it distorts the chronic coefficient
+rather than adding anything. The concentration-versus-volume contrast
+above captures what the ratio was meant to capture, without the
+redundancy.
+
+In-game load is lagged, not contemporaneous. The current game's distance
+is reverse-caused (a player who breaks down logs a low distance in the
+game it happens) so it reads protective for the wrong reason. I use the
+last played game and two played games back. Both are known before the
+interval opens, and they separate two signals: lag-1 carries the
+load-management pattern, so should read protective through selection;
+lag-2 sits before that compromise, where a real fatigue spike should
+show. Cost: first two games each season drop out.
+
+Intensity (distance per minute) is deliberately out of the primary
+model, and tested separately below. It is close to orthogonal to load
+(\|r\| ≤ `r round(r_int_load, 2)`) so it is a real construct, not a
+relabel, but a per-game rate needs a base of minutes to mean anything (I
+require 10+, which makes it more missing than the load terms) and the
+rolling windows were null.
+
+The schedule block carries both the accumulated dose and the
+point-in-time flags, deliberately. The dose is the exposure measure. The
+flags are contaminated by coaching decisions, since a coach rests an
+at-risk player tonight. I keep them so the contrast is visible in the
+results rather than hidden by dropping them, and mark them
+selection-biased wherever they appear.
 
 ## Model 1 - Workload
 
@@ -524,17 +611,14 @@ summary(m3)
 
 ## Does each domain earn its place?
 
-The classical likelihood-ratio test does not work here. LRT compares two
-log-likelihoods, but `cluster(PLAYER_ID)` doesn't change the likelihood,
-it only replaces the variance estimate afterwards. So an LRT would use
-the naive likelihood and ignores the correlation corrected for. Instead
-I use a **robust Wald test** on the block of newly-added coefficients,
-built from the clustered variance-covariance matrix, plus the change in
-concordance.
+A likelihood-ratio test is not valid here. `cluster(PLAYER_ID)` does not
+change the likelihood, only the variance estimated afterwards, so an LRT
+would read the uncorrected likelihood diregarding the clustering
+adjustment. I use a robust Wald test on the newly-added block instead,
+built from the clustered covariance, plus the change in concordance.
 
 ```{r nested-tests, dependson=c("m1","m2","m3")}
-# Joint H0 test that the coefficients in a model are all zero, using the
-# robust (clustered) covariance. Small p => the block contributes beyond the prior model.
+# Joint H0 test that the coefficients in a model are all zero, using the robust (clustered) covariance. 
 robust_wald <- function(model, added_terms) {
   cf   <- coef(model)
   norm <- function(s) gsub("\\s", "", s)      # I(x^2) spacing varies; match robustly
@@ -574,297 +658,60 @@ m3_tidy <- tidy(m3, exponentiate = TRUE, conf.int = TRUE) %>%
 show_tbl(m3_tidy, "Model 3 - hazard ratios, sorted by effect size (not by p)")
 ```
 
-## Does the exposure choice matter?
-
-I report on-court load, but load and minutes are \~0.995 collinear here,
-so a fair question is whether anything hinges on that choice. It does
-not. Refitting the *whole* of Model 3 with minutes swapped in for load
-leaves discrimination and the headline hazard ratios essentially
-unchanged.
-
-```{r robustness-minutes, dependson="model-specs"}
-m3_min <- fit_cox(m3_terms_min)   # same Model 3, minutes in place of load
-
-robust_tab <- tibble(
-  Metric = c("Concordance", "Chronic workload HR (per SD)",
-             "Acute workload HR (per SD)", "ACWR HR (per SD)"),
-  `Load (reported)` = c(
-    round(summary(m3)$concordance[1], 4),
-    hr(m3, "z_ROLLING_LOAD_28D"), hr(m3, "z_ROLLING_LOAD_7D"), hr(m3, "z_ACWR_LOAD")),
-  `Minutes (robustness)` = c(
-    round(summary(m3_min)$concordance[1], 4),
-    hr(m3_min, "z_ROLLING_MIN_28D"), hr(m3_min, "z_ROLLING_MIN_7D"), hr(m3_min, "z_ACWR_MIN"))
-)
-show_tbl(robust_tab, "Robustness - on-court load vs minutes give the same answer")
-```
-
-So the exposure choice is not driving the result. I lead with load
-because it is the better *construct*, what the body absorbed rather than
-what the coach decided.
-
-## Does intensity add anything beyond volume?
-
-Load and minutes are both **volume** measures. Intensity (distance
-covered *per minute*) is the obvious candidate for the thing they miss:
-how hard a player worked, not how long. It is nearly uncorrelated with
-the load terms here, so if intensity carried independent injury signal
-this is where it would show. I add the same prospective lag pair
-(previous game, two games back) to the full Model 3 and test whether the
-pair is jointly zero.
-
-```{r robustness-intensity, dependson="model-specs"}
-# Fit on the rows where intensity is defined for BOTH models, so the comparison is like
-# for like (intensity needs >=10 minutes played, so it is missing more often than load).
-need_int <- c(setdiff(m3_terms, "I(z_SEASONS_IN_LEAGUE^2)"), intensity_terms)
-cox_int  <- cox %>% filter(if_all(all_of(need_int), ~ !is.na(.)))
-
-m3_int_base <- coxph(as.formula(paste0(surv_lhs, " ~ ", paste(m3_terms, collapse = " + "),
-                     " + ", rhs_tail)), data = cox_int, ties = "efron")
-m3_int_plus <- coxph(as.formula(paste0(surv_lhs, " ~ ",
-                     paste(c(m3_terms, intensity_terms), collapse = " + "),
-                     " + ", rhs_tail)), data = cox_int, ties = "efron")
-
-# Joint robust Wald test that both intensity coefficients are zero.
-cf <- coef(m3_int_plus); V <- vcov(m3_int_plus); idx <- match(intensity_terms, names(cf))
-int_wald <- as.numeric(t(cf[idx]) %*% solve(V[idx, idx]) %*% cf[idx])
-int_p    <- pchisq(int_wald, length(idx), lower.tail = FALSE)
-
-intensity_tab <- tibble(
-  Metric = c("Concordance", "Chronic load HR (per SD)", "Acute load HR (per SD)",
-             "In-game intensity, last game (per SD)", "In-game intensity, 2 games back (per SD)"),
-  `Model 3` = c(round(summary(m3_int_base)$concordance[1], 4),
-                hr(m3_int_base, "z_ROLLING_LOAD_28D"), hr(m3_int_base, "z_ROLLING_LOAD_7D"), NA, NA),
-  `+ intensity` = c(round(summary(m3_int_plus)$concordance[1], 4),
-                hr(m3_int_plus, "z_ROLLING_LOAD_28D"), hr(m3_int_plus, "z_ROLLING_LOAD_7D"),
-                hr(m3_int_plus, "z_PREV_GAME_INTENSITY"), hr(m3_int_plus, "z_PREV_2GAME_INTENSITY"))
-)
-show_tbl(intensity_tab, paste0("Intensity robustness - joint Wald test that both intensity terms are zero: p = ",
-                               fmt_p(int_p)))
-```
-
-**Intensity adds nothing once volume is accounted for.** Concordance is
-unchanged to the third decimal, and the load hazard ratios do not move.
-Both intensity hazard ratios are reported **per standard deviation**, the
-same scale as every other covariate in this document, and they sit close
-to 1. The caveat worth stating plainly: a per-SD move in intensity is a
-*small* physical change (these players all move at broadly similar
-rates), so this is not evidence that how hard you work is irrelevant, it is
-evidence that the *narrow band of intensity visible in public tracking
-data* carries no injury signal beyond volume. The high-speed,
-high-acceleration component that sports science implicates in soft-tissue
-injury is not resolvable in a per-game distance-per-minute average. On
-that basis intensity stays out of the primary model.
-
-## Does the deep bench dilute the result?
-
-The sample is every player who appeared at all, and that includes players
-at the very end of the rotation: 1-to-20-game seasons, single-digit
-minutes. Their availability is driven by coaching and roster politics
-far more than by health, so in principle they add at-risk time that is
-noise with respect to injury. They are a real share of the rows
-(1-to-20-game seasons are about 23% of player-seasons and 11% of rows)
-but a much smaller share of the events (under 5%), which is the profile
-of observations that dilute rather than inform.
-
-The obvious fix (dropping players with few games *this* season) is a
-trap. A player appears in few games precisely *because* he got hurt, so
-filtering on this-season availability preferentially deletes the injured
-and biases the workload effect toward null. That is conditioning on a
-post-baseline outcome. Instead I define the cohort **ex ante**, on the
-*previous* season's minutes per game, which is fixed before any of this
-season's injuries occur and so cannot be caused by them.
-
-```{r sensitivity-rotation, dependson="model-specs"}
-ROTATION_MPG <- 15   # prior-season minutes per game: an established rotation player
-
-# Three groups, not two. PRIOR_SEASON_MIN_PG is a real 0 for rookies (they genuinely have
-# no prior season) but NA for a non-rookie whose prior season is simply absent from the
-# record: a season-long injury absence, the G League, or overseas. Those are returning
-# players, not deep bench, so file 5 keeps them NA rather than zero-filling them, and
-# they are reported separately here instead of being silently pooled with the low-minute
-# group. The >= filter drops NA rows, so the cohort is "known rotation player" only.
-rot_groups <- cox %>%
-  mutate(Group = case_when(
-    is.na(PRIOR_SEASON_MIN_PG)              ~ "No prior-season record",
-    PRIOR_SEASON_MIN_PG >= ROTATION_MPG     ~ paste0("Rotation (>= ", ROTATION_MPG, " mpg)"),
-    TRUE                                    ~ paste0("Below threshold (< ", ROTATION_MPG, " mpg)"))) %>%
-  group_by(Group) %>%
-  summarise(`Intervals` = n(), Events = sum(event),
-            `Events per 1,000 intervals` = round(1000 * sum(event) / n(), 2), .groups = "drop")
-show_tbl(rot_groups, "Event rate by prior-season role (the dilution, quantified)")
-
-# Pull the three rates out as plain values so the prose can quote them inline
-# (an inline `r ...` cannot contain backticks, so no backtick-quoted column names).
-rate_of  <- function(pat) rot_groups[["Events per 1,000 intervals"]][grepl(pat, rot_groups$Group)]
-rate_low <- rate_of("Below"); rate_rot <- rate_of("Rotation"); rate_na <- rate_of("No prior")
-n_noprior <- cox %>% distinct(SEASON, PLAYER_ID, .keep_all = TRUE) %>%
-  summarise(n = sum(is.na(PRIOR_SEASON_MIN_PG))) %>% pull(n)
-
-# Filtering on PRIOR_SEASON_MIN_PG alone would drop every one of the no-prior-season
-# players, because NA fails the >= test. That is the wrong cut: all of them have real NBA
-# history, and the group is Klay Thompson, Kawhi Leonard, Jamal Murray, John Wall, Zion
-# Williamson - players missing a season through injury, i.e. exactly the high-burden
-# rotation players this sensitivity analysis is supposed to retain. So I fall back to
-# CAREER minutes per game where the prior season is missing. Career totals are built from
-# seasons BEFORE the modelled one (file 3), so this is still fixed before any of this
-# season's injuries occur and the cohort stays ex ante.
-cox <- cox %>%
-  mutate(CAREER_MPG     = if_else(CAREER_GAMES > 0, CAREER_MINUTES / CAREER_GAMES, NA_real_),
-         ROTATION_BASIS = coalesce(PRIOR_SEASON_MIN_PG, CAREER_MPG))
-
-n_restored <- cox %>% distinct(SEASON, PLAYER_ID, .keep_all = TRUE) %>%
-  summarise(n = sum(is.na(PRIOR_SEASON_MIN_PG) & ROTATION_BASIS >= ROTATION_MPG, na.rm = TRUE)) %>%
-  pull(n)
-
-cox_rot <- cox %>% filter(ROTATION_BASIS >= ROTATION_MPG)
-m3_rot  <- coxph(as.formula(paste0(surv_lhs, " ~ ", paste(m3_terms, collapse = " + "),
-                 " + ", rhs_tail)), data = cox_rot, ties = "efron")
-
-rot_tab <- tibble(
-  Metric = c("Player-intervals (n)", "Events", "Concordance",
-             "Chronic load HR (per SD)", "Acute load HR (per SD)", "ACWR HR (per SD)",
-             "In-game load, last game", "In-game load, 2 games back"),
-  `All players (primary)` = c(m3$n, m3$nevent, round(summary(m3)$concordance[1], 4),
-     hr(m3, "z_ROLLING_LOAD_28D"), hr(m3, "z_ROLLING_LOAD_7D"), hr(m3, "z_ACWR_LOAD"),
-     hr(m3, "z_PREV_GAME_DISTANCE"), hr(m3, "z_PREV_2GAME_DISTANCE")),
-  `Rotation players only` = c(m3_rot$n, m3_rot$nevent, round(summary(m3_rot)$concordance[1], 4),
-     hr(m3_rot, "z_ROLLING_LOAD_28D"), hr(m3_rot, "z_ROLLING_LOAD_7D"), hr(m3_rot, "z_ACWR_LOAD"),
-     hr(m3_rot, "z_PREV_GAME_DISTANCE"), hr(m3_rot, "z_PREV_2GAME_DISTANCE"))
-)
-show_tbl(rot_tab, paste0("Sensitivity - restricted to established rotation players (>= ",
-                         ROTATION_MPG, " mpg in the prior season, or across their career ",
-                         "where the prior season is missing)"))
-```
-
-The workload result is not an artefact of the deep bench. Restricting to
-established rotation players raises the workload hazard ratios: chronic
-load goes from `r hr(m3, "z_ROLLING_LOAD_28D")` to
-`r hr(m3_rot, "z_ROLLING_LOAD_28D")` per SD and the ACWR spike from
-`r hr(m3, "z_ACWR_LOAD")` to `r hr(m3_rot, "z_ACWR_LOAD")`, with the
-lagged in-game structure keeping its shape (protective lag-1, harmful
-lag-2). Discrimination goes the other way, from
-`r round(summary(m3)$concordance[1], 3)` to
-`r round(summary(m3_rot)$concordance[1], 3)`.
-
-Both movements have the same cause and neither is a surprise. The
-restricted cohort is deliberately more homogeneous, so the effects are
-estimated on a cleaner population while there is less variation left to
-rank. I keep the full sample as primary because it describes the league
-rather than a subset of it, and report this as the check that the
-workload effects are not manufactured by the deep bench.
-
-The dilution is visible directly in the event rates above: intervals
-below the threshold run at `r rate_low` events per 1,000 against
-`r rate_rot` above it, roughly a two-and-a-half-fold difference in how
-often the rows actually inform the model.
-
-**A note on how the cohort is defined, because the obvious version of it
-is wrong.** Filtering on prior-season minutes alone silently deletes the
-`r n_noprior` player-seasons with no prior-season record, since `NA`
-fails a `>=` test. Those are not fringe players. Every one of them has
-real NBA history, and the group is Klay Thompson, Kawhi Leonard, Jamal
-Murray, John Wall, Zion Williamson: players who missed an entire season
-through injury. Dropping them from a sensitivity analysis about rotation
-players would remove the highest injury-burden veterans in the league on
-a technicality, and would bias this check in exactly the direction that
-makes it useless. So where the prior season is missing I fall back to
-career minutes per game, which restores `r n_restored` player-seasons to
-the cohort. Career totals are built only from seasons before the one
-being modelled, so the cohort remains fixed in advance and the collider
-problem does not return.
-
-I keep the **full sample as primary** (it is the honest population of
-NBA players and the broader claim) and report this as the sensitivity
-check that the effects survive, indeed sharpen, among the players a
-practitioner would actually be managing.
-
-One limitation remains, and one earlier problem is worth recording
-because of how nearly it went unnoticed.
-
-The limitation is rookies. They genuinely have no prior season and no
-career history to fall back on, so they sit outside this check by
-construction rather than by choice.
-
-The earlier problem was the `r n_noprior` non-rookie player-seasons with
-**no prior-season record at all**. An earlier version of this build
-zero-filled them, which is indistinguishable from a player who logged
-zero minutes, so they were quietly swept out with the deep bench. They
-are the opposite of deep bench. Their event rate (`r rate_na` per 1,000)
-sits above the below-threshold group, and their career minutes run to a
-median of about 17 per game. Separating genuine missingness from a true
-zero made the problem visible; the career-minutes fallback is what
-actually fixed it. The lesson is that a zero-fill and a missing value are
-not the same statement, and the difference here was the entire
-returning-from-injury population.
-
 ## What it shows
 
-Both blocks earn their place, and concordance climbs at each step to
-`r round(summary(m3)$concordance[1], 3)`. That means given two
-comparable player-intervals, the model ranks the one that actually gets
-injured as higher-risk about
-`r round(100 * summary(m3)$concordance[1])`% of the time, against 50% by
-chance. For a model built entirely from **public box-score and schedule
-data**, with no access to GPS, medical screening or training-load data,
-I think that is the honest near ceiling rather than a disappointment,
-and establishing that ceiling is itself a useful finding for anyone
-deciding whether public data is sufficient for this task.
+Both blocks earn their place and concordance climbs to
+`r round(summary(m3)$concordance[1], 3)`: given two comparable
+intervals, the model ranks the one that gets injured higher about
+`r round(100 * summary(m3)$concordance[1])`% of the time against 50% by
+chance. From public box-score and schedule data alone, no GPS, no
+medical screening, no training load, I read that as close to the honest
+ceiling. Establishing where that ceiling sits is itself worth knowing.
 
-Chronic 28-day load is the headline effect at **HR
-`r round(summary(m3)$conf.int["z_ROLLING_LOAD_28D", 1], 1)` per SD**.
+Chronic 28-day load is the headline at HR
+`r round(summary(m3)$conf.int["z_ROLLING_LOAD_28D", 1], 1)` per SD.
 
-What I want to flag as explicitly *not* a finding is that two
-point-in-time flags come out looking protective: the back-to-back flag
-and the road-trip flag. Playing the second night of a back-to-back reads
-as *safer*, which makes no physiological sense. It is **health-gating**:
-a coach sits a player who is carrying something, so the flag partly
-records who was judged fit that night rather than what they were exposed
-to. Both vary between team-mates on the same date, which is the tell.
-This is why the accumulated dose measures are the ones I interpret.
+Two point-in-time flags read protective, the back-to-back and the
+road-trip flag. Playing the second night of a back-to-back is not safer.
+It is health-gating, since a coach sits a player carrying something, so
+the flag partly records who was judged fit. Both vary between team-mates
+on the same date, which is the tell. This is why I interpret the
+accumulated dose measures instead.
 
-**Team days rest is the opposite case, and worth separating out.** It is
-protective (HR `r hr(m3, "z_TEAM_DAYS_REST")`), and here that is exactly
-what physiology predicts rather than a puzzle. It is also the one
-schedule covariate that *cannot* be health-gated: it comes off the
-fixture list and every player on a team shares the same value on a given
-date, so no decision about an individual can move it. Its SD is about one
-day, so the estimate works out at roughly 13% lower hazard per extra rest
-day, against the 15.96% lower injury odds Lewis (2018) reports on
-different seasons with a different model. On the one covariate where
-selection is ruled out by construction, an independent published estimate
-comes back almost exactly. It carries no selection asterisk.
+Team days rest is the opposite case. Protective at HR
+`r hr(m3, "z_TEAM_DAYS_REST")`, which is what physiology predicts rather
+than a puzzle, and it is the one schedule covariate that cannot be
+health-gated: it comes off the fixture list and every team-mate shares
+it on a given date. Its SD is about a day, so that is roughly 13% lower
+hazard per extra rest day, against Lewis (2018) reporting 15.96% lower
+odds on different seasons with a different model. On the one covariate
+where selection is ruled out by construction, an independent estimate
+comes back almost exactly. No asterisk.
 
-`RECENT_RETURN` belongs in that same group, and it is the clearest case
-of all. A player in the fortnight after returning carries HR
-`r hr(m3, "RECENT_RETURN")`, i.e. materially *lower* hazard, against a
-literature that expects return-to-play to be a high-risk window. Nobody
-returns until medical staff clear them, and nobody comes back to a full
-load: the first weeks back are minutes-restricted and deliberately
-ramped. So the covariate measures who was permitted to play, not whether
-returning is safe. It carries the same selection asterisk as rest and the
-back-to-back flag, and it is a fourth instance of the same mechanism
-rather than a separate puzzle.
+`RECENT_RETURN` is the clearest case of the same thing. A player in the
+fortnight after returning carries HR `r hr(m3, "RECENT_RETURN")`, lower
+hazard, against a literature expecting return-to-play to be high risk.
+Nobody returns before medical staff clear them and nobody comes back to
+a full load. It measures who was permitted to play, not whether
+returning is safe, and carries the same selection asterisk.
 
 ------------------------------------------------------------------------
 
-# Stage 2 - The proportional-hazards assumption
+# Stage 3 - The proportional-hazards assumption {#stage3}
 
-The Cox model assumes each covariate's effect is **constant over time**,
-that heavy chronic load is as dangerous in game 70 as in game 10. That
-is a strong assumption and it is testable. I use scaled Schoenfeld
-residuals (`cox.zph`), which essentially ask whether the covariate
-values of the players who actually fail drift systematically as the
-season progresses.
+Feeds article 2.6, 3.3 and Appendix B.1.
 
-This stage is a core of the thesis, a violation here is a finding. It
-would mean a risk factor intensifies or fades across a season, a dynamic
-that only the time-to-event framing can surface at all. So I went in
-genuinely hoping to find one.
+Cox assumes each covariate's effect is constant over time: heavy chronic
+load as dangerous in game 70 as in game 10. Testable with scaled
+Schoenfeld residuals, which ask whether the covariate values of the
+players who fail drift as the season progresses.
 
-I set `transform = "identity"` so the time axis stays raw **game
-number**. The default Kaplan-Meier transform would compress the axis in
-a way that makes the plotted trend hard to reconcile with any
-time-interaction I might fit afterwards.
+A violation here would be a finding, not a problem, since it would mean
+a risk factor intensifies or fades across a season, which only the
+time-to-event framing can surface. I went in hoping to find one.
+
+`transform = "identity"` keeps the axis as raw game number, so the
+plotted trend is readable against any time-interaction I might fit.
 
 ```{r ph-tests, dependson=c("m1","m2","m3")}
 zph1 <- cox.zph(m1, transform = "identity")
@@ -885,15 +732,16 @@ zph3_tab %>%
 ```
 
 `r sum(zph3_tab$flag != "")` individual covariates flagged at p \< 0.05
-(the two lag in-game load terms among them, at p ≈ 0.002 and 0.007).
+(the two lag in-game load terms among them, at p =
+`r fmt_p(zph3_tab$p[zph3_tab$term == "z_PREV_GAME_DISTANCE"])` and
+`r fmt_p(zph3_tab$p[zph3_tab$term == "z_PREV_2GAME_DISTANCE"])`).
 
 ## The plots, which is where the decision actually got made
 
-The p-value only tells me a slope isn't exactly zero, at
-`r format(m3$nevent, big.mark = ",")` events, a near-flat line will
-still test significant. The *shape* is what matters, so I plot every
-term. A flat line means the assumption holds; a sloping line means the
-effect drifts.
+A p-value only says the slope is not exactly zero, and at
+`r format(m3$nevent, big.mark = ",")` events a near-flat line still
+tests significant. Shape is what matters, so I plot every term: flat
+means the assumption holds, sloping means the effect drifts.
 
 ```{r schoenfeld-plots, dependson="ph-tests", fig.height=4.2, fig.width=7.5, results="hold"}
 for (v in plot_terms) {
@@ -906,19 +754,16 @@ for (v in plot_terms) {
 
 ## What it shows, and why I remedied nothing
 
-At `r format(m3$nevent, big.mark = ",")` events the global test is all
-but guaranteed to reject (GLOBAL p =
+The global test was always going to reject at
+`r format(m3$nevent, big.mark = ",")` events (p =
 `r fmt_p(zph3_tab$p[zph3_tab$term == "GLOBAL"])`), and
-`r sum(zph3_tab$flag != "")` individual terms flag. But significance is
-not the question at this sample size. Two things settle it: the *shape*
-of each drift (the plots above), and whether any of it is a biological
-effect a time-varying coefficient could legitimately capture.
-Decomposing the violators by the *direction* they drift shows it is not.
+`r sum(zph3_tab$flag != "")` terms flag individually. Significance is
+not the question here. What settles it is the shape of each drift and
+whether any of it is biological. Decomposing by drift direction says it
+is not.
 
 ```{r ph-decomp, dependson=c("ph-tests","m3")}
-# Direction of each violation: does beta(t) weaken TOWARD zero (the effect fading) or
-# sharpen AWAY from it? Read from the sign of each Schoenfeld residual's drift vs the
-# base coefficient - no refitting needed.
+# Direction of each violation: does beta(t) weaken TOWARD zero (the effect fading) 
 bhat <- coef(m3)
 vt   <- zph3_tab %>% filter(flag != "") %>% pull(term)
 slope_sign <- sapply(vt, function(v) sign(cov(zph3$x, zph3$y[, match(v, colnames(zph3$y))])))
@@ -927,21 +772,37 @@ reading <- tribble(
   "z_CAREER_GAMES_MISSED",          "Durability history - frailty compression",
   "z_PREV_GAME_DISTANCE",           "Load-management signal - selection",
   "z_PREV_2GAME_DISTANCE",          "Fatigue-spike signal - selection",
-  "z_ACWR_LOAD",                    "Load spike - selection",
   "z_SEASONS_IN_LEAGUE",            "Experience - survivor pool",
   "I(z_SEASONS_IN_LEAGUE^2)",       "Experience curvature",
   "z_PLAYER_ROAD_TRIP_GAME_NUMBER", "Availability marker",
   "IS_PLAYER_ROAD_TRIP",            "Availability marker - sharpening",
   "z_ROLLING_GAMES_7D",             "~zero effect (direction immaterial)",
-  "z_ROLLING_DIST_7D",              "~zero effect (direction immaterial)")
+  "z_ROLLING_DIST_7D",              "~zero effect (direction immaterial)",
+  "z_PRIOR_EPISODES_SEASON",        "Prior-injury history - frailty compression",
+  "IS_POST_ALLSTAR",                "Season phase - context, not a risk factor",
+  "z_IS_B2B",                       "Availability marker - selection",
+  "PLAYED_PRESEASON",               "Pre-season availability - selection",
+  "z_SEASON_CUMULATIVE_DIST",       "Accumulated travel - exposure",
+  "z_TEAM_DAYS_REST",               "Availability marker - selection",
+  "RECENT_RETURN",                  "Prior-injury history - frailty compression",
+  "z_PCT_THROUGH_SEASON",           "Season phase - context, not a risk factor",
+  "z_ROLLING_LOAD_7D",              "Acute load",
+  "z_ROLLING_LOAD_28D",             "Chronic load",
+  "z_ROLLING_B2B_7D",               "Congestion dose - exposure",
+  "z_ROLLING_B2B_28D",              "Congestion dose - exposure",
+  "z_ROLLING_DIST_28D",             "Chronic travel - exposure",
+  "z_HEIGHT_INCHES",                "Anthropometry",
+  "z_WEIGHT",                       "Anthropometry")
 decomp <- tibble(term = vt, `HR (per SD)` = round(exp(bhat[vt]), 2),
                  Drift = ifelse(slope_sign != sign(bhat[vt]), "toward 0", "away")) %>%
-  left_join(reading, by = "term") %>% mutate(Term = sub("z_", "", term)) %>%
+  left_join(reading, by = "term") %>%
+  mutate(Term = sub("z_", "", term),
+         Reading = coalesce(Reading, "(unclassified)")) %>%   # never print a bare NA
   select(Term, `HR (per SD)`, Drift, Reading)
 n_toward <- sum(decomp$Drift == "toward 0"); n_viol <- nrow(decomp)
 show_tbl(decomp, "PH violators by drift direction - all selection or context, none biological")
 
-# The obvious remedy, tested: let acute load's effect differ early vs late in the season.
+# Let acute load's effect differ early vs late in the season.
 cut <- median(cox$t_stop)
 cox$.period <- factor(ifelse(cox$t_stop <= cut, "early", "late"), levels = c("early", "late"))
 f_plain <- as.formula(paste0(surv_lhs, " ~ ", paste(m3_terms, collapse = " + "), " + ", rhs_tail))
@@ -964,71 +825,62 @@ oos_s <- cidx(coxph(as.formula(paste0(surv_lhs, " ~ ",
 
 Three points close the case for reporting the proportional model:
 
-1.  **The drift is selection, not biology.** `r n_toward` of the
-    `r n_viol` violators weaken *toward* zero across the season - the
-    signature of survivor / frailty compression: as the most
-    injury-prone players leave the risk pool, the durability and history
-    effects (career games missed, the load-management and spike signals)
-    fade. The few that sharpen *away* from zero are availability markers
-    (the road-trip flag tightening as load-management intensifies late in
-    the year), and two of them sit on covariates with essentially no
-    effect at all (7-day games and travel, HR ≈ 1.0). None of it is a
-    physiological risk that genuinely changes with the calendar.
-2.  **The covariate that carries the causal claim is stable.** Chronic
-    28-day load tests cleanly proportional (p =
-    `r fmt_p(zph3_tab$p[zph3_tab$term == "z_ROLLING_LOAD_28D"])`), and
-    so does acute load (p =
-    `r fmt_p(zph3_tab$p[zph3_tab$term == "z_ROLLING_LOAD_7D"])`). Every
-    violation sits on a selection-contaminated or context term - exactly
-    the ones I already decline to read causally.
-3.  **The standard remedy buys nothing, and I fitted it to find out.**
-    When a covariate breaks proportionality the usual fix is to stop
-    holding its coefficient fixed and let it change with time. I tested
-    that on acute load, since that is the term the causal argument rests
-    on, splitting the season in half.
+1.  The drift is selection. `r n_toward` of the `r n_viol` violators
+    weaken toward zero, which is survivor and frailty compression: as
+    the most injury-prone players leave the pool, the durability and
+    history effects fade. Those sharpening away are availability
+    markers, and two sit on covariates with no effect at all (HR ≈ 1.0,
+    where direction is meaningless).
 
-    I fitted it two ways, and the gap between them is instructive. Refit
-    the *whole model* separately on each half and the drift looks real:
-    HR `r round(ss_e, 2)` early against `r round(ss_l, 2)` late. But that
-    lets every coefficient move between halves, so the acute-load change
-    is soaking up movement from everywhere else. Fit one model across all
-    the rows and let *only* acute load interact with season half, and it
-    nearly vanishes: `r round(iso_e, 2)` against `r round(iso_l, 2)`.
-    Most of the apparent drift was never acute load's.
+2.  The covariates carrying the causal claim are stable. Chronic load p
+    = `r fmt_p(zph3_tab$p[zph3_tab$term == "z_ROLLING_LOAD_28D"])`,
+    acute load p =
+    `r fmt_p(zph3_tab$p[zph3_tab$term == "z_ROLLING_LOAD_7D"])`. Every
+    violation sits on a term I already decline to read causally.
 
-    What settles it is the held-out season: concordance
-    `r round(oos_b, 4)` proportional against `r round(oos_s, 4)` with the
-    time-varying term. It changes nothing about how the model transfers.
-    Given every violator drifts for reasons of selection rather than
-    biology, a time-varying coefficient would fit that selection rather
-    than remove it.
+3.  The standard remedy buys nothing, and I fitted it to find out. The
+    usual fix for a violation is to let the coefficient change with
+    time. I tested it on acute load, splitting the season in half.
 
-The season dynamic is real, but it lives in the **baseline hazard** -
-which climbs materially over the year (quantified in Stage 5) - and
-`strata(SEASON)` already absorbs it, so it never needed to be in a
-coefficient. A proportional model with a stratified baseline is the
-honest and more actionable description: a bad chronic load is a bad
-chronic load whenever in the season it lands.
+    Two ways, and the gap between them is the instructive part. Refit
+    the whole model on each half and the drift looks real: HR
+    `r round(ss_e, 2)` early against `r round(ss_l, 2)` late. But that
+    lets every coefficient move, so acute load is soaking up movement
+    from everywhere else. Fit one model and let only acute load interact
+    with season half and it nearly vanishes: `r round(iso_e, 2)` against
+    `r round(iso_l, 2)`. Most of the drift was never acute load's.
+
+    The held-out season settles it: concordance `r round(oos_b, 4)`
+    proportional against `r round(oos_s, 4)` with the time-varying term.
+    Nothing changes. A time-varying coefficient here would fit the
+    selection rather than remove it.
+
+The season dynamic is real but lives in the baseline hazard (quantified
+in Stage 6), which `strata(SEASON)` already absorbs. A bad chronic load
+is a bad chronic load whenever in the season it lands.
 
 ------------------------------------------------------------------------
 
-# Stage 3 - Reporting and calibration
+# Stage 4 - Reporting and calibration {#stage4}
 
-Using Model 3, this stage produces the numbers that go in the results:
-how well the model discriminates, whether its risk score correctly
-orders risk, and the final hazard-ratio table organised by domain.
+Feeds article 3.4 and Appendix B.5.
 
-I dont produce a classic absolute-risk calibration curve, and that is a
-design consequence, with `strata(SEASON)` there are five baseline
-hazards rather than one, and each row is a game-interval rather than a
-person, so "predicted 30-day risk" is not well defined here. What my
-design supports, is relative-hazard calibration: group intervals by risk
-score and check that the observed event rate climbs across the groups.
+No classic absolute-risk calibration curve, which is a design
+consequence: `strata(SEASON)` gives five baseline hazards, and each row
+is a game-interval rather than a person, so "predicted 30-day risk" is
+not well defined. What the design supports is relative-hazard
+calibration: group intervals by risk score, check the observed event
+rate climbs across groups.
 
 ```{r calibration, dependson="m3"}
 cstat <- summary(m3)$concordance
 c_est <- cstat[1]; c_se <- cstat[2]
 c_lo  <- c_est - 1.96 * c_se; c_hi <- c_est + 1.96 * c_se
+
+# knitr caches the fitted model but not the environment its formula points at, so a
+# cached m3 cannot rebuild its model frame and predict() fails with "object 'cox' not
+# found". Re-point the terms environment at this chunk, where cox is loaded.
+attr(m3$terms, ".Environment") <- environment()
 
 cox_lp <- cox %>%
   mutate(risk_score = as.numeric(predict(m3, newdata = ., type = "lp"))) %>%
@@ -1068,7 +920,6 @@ domain_map <- tribble(
   ~term,                            ~domain,          ~label,
   "z_ROLLING_LOAD_7D",              "Workload",       "Acute on-court load (7d)",
   "z_ROLLING_LOAD_28D",             "Workload",       "Chronic on-court load (28d)",
-  "z_ACWR_LOAD",                    "Workload",       "Acute:chronic load ratio",
   "z_ROLLING_GAMES_7D",             "Workload",       "Acute games played (7d)",
   "z_ROLLING_DIST_7D",              "Workload",       "Acute travel load (7d)",
   "z_ROLLING_DIST_28D",             "Workload",       "Chronic travel load (28d)",
@@ -1115,28 +966,26 @@ and the risk score orders observed hazard almost perfectly across
 deciles (Spearman 1). The model reliably sorts high-risk from low-risk
 intervals even though it cannot state an absolute probability. For an
 operational use case, who should be managed this week, ranking is the
-operative quantity anyway.
+suitable.
 
 ------------------------------------------------------------------------
 
-# Stage 4 - Recurrent-events robustness
+# Stage 5 - Recurrent events and frailty {#stage5}
 
-Model 3 counts only the first new injury of a kind, which throws away
-information, players get injured repeatedly, and that repetition is an
-aspect the applied literature cares most. Rather than pick one
-recurrent-events model and hope, I fit three that make different
-assumptions.
+Feeds article 2.6, 3.6 and Appendix B.4.
 
--   **Andersen-Gill (AG)** - every event counts, common baseline,
-    marginal interpretation. "what raises the hazard of *any* injury
-    onset".
--   **PWP gap-time** - stratifies the baseline by event order (1st / 2nd
-    / 3rd+) and resets the clock after each event, so risk is "games
-    since last injury". "whether a second injury is intrinsically
-    different from a first."
--   **Shared frailty** - a per-player random intercept. Its variance θ
-    is a direct, single-number measure of unobserved injury-proneness,
-    which is the Martin (2021) claim stated as a testable quantity.
+Model 3 counts only first new injuries, which throws information away:
+players get hurt repeatedly and that repetition is what the applied
+literature cares about most. Rather than pick one recurrent-events model
+and hope, I fit three that assume different things.
+
+-   Andersen-Gill - every onset counts, common baseline, marginal. "What
+    raises the hazard of any injury onset?"
+-   PWP gap-time - baseline stratified by event order, clock reset after
+    each event. "Is a second injury different from a first?"
+-   Shared frailty - per-player random intercept. Its variance θ is a
+    single-number measure of unobserved proneness, which is the Martin
+    (2021) claim made testable.
 
 ```{r ag-model, dependson="model-specs"}
 m3_ag <- fit_cox(m3_terms, lhs = "Surv(t_start, t_stop, event_recurrent)")
@@ -1157,7 +1006,7 @@ show_tbl(ag_compare, "Primary (new injury) vs Andersen-Gill (all injury)")
 pwp <- cox %>%
   arrange(SEASON, PLAYER_ID, t_stop) %>%
   group_by(SEASON, PLAYER_ID) %>%
-  mutate(ep_order = 1L + cumsum(lag(event_recurrent, default = 0L))) %>%
+  mutate(ep_order = 1L + cumsum(dplyr::lag(event_recurrent, default = 0L))) %>%
   group_by(SEASON, PLAYER_ID, ep_order) %>%
   mutate(gap_stop  = row_number(),
          gap_start = gap_stop - 1L) %>%
@@ -1179,9 +1028,75 @@ pwp_fit <- coxph(
 
 pwp %>%
   group_by(ep_order_capped) %>%
-  summarise(rows = n(), events = sum(event_recurrent), .groups = "drop") %>%
+  summarise(rows = n(), events = sum(event_recurrent),
+            `Rate per 1,000` = round(1000 * events / rows, 1), .groups = "drop") %>%
   show_tbl("Events by injury-spell stratum")
 ```
+
+### What the spell strata do to the baseline
+
+`strata(SEASON, ep_order_capped)` is the part of this model I find most
+informative, and it is easy to skim past because it produces no
+coefficient at all. Stratifying tells the model to fit a separate
+baseline hazard for a player's 1st, 2nd and 3rd-or-later spell, while
+sharing the covariate effects across them. Nothing about being on your
+third injury of the season is charged to a workload term; it is absorbed
+into the shape of the baseline. So if the baselines separate, that is
+recurrence risk showing up in a place no covariate can explain away.
+
+They separate a lot.
+
+```{r pwp-baseline, dependson="pwp"}
+GAP_AT <- 10   # read the baselines at a common gap-time: 10 games back from injury
+
+pwp_base <- basehaz(pwp_fit, centered = FALSE) %>% as_tibble() %>%
+  mutate(Spell = case_when(grepl("1st", strata) ~ "1st",
+                           grepl("2nd", strata) ~ "2nd",
+                           grepl("3rd", strata) ~ "3rd+")) %>%
+  filter(!is.na(Spell), time <= GAP_AT) %>%
+  group_by(strata, Spell) %>% summarise(H = max(hazard), .groups = "drop") %>%
+  group_by(Spell) %>% summarise(H = mean(H), .groups = "drop") %>%   # average over seasons
+  mutate(`Baseline cumulative hazard` = round(H, 4),
+         `Relative to 1st spell` = round(H / H[Spell == "1st"], 2)) %>%
+  select(-H)
+show_tbl(pwp_base, paste0("Baseline hazard by injury spell, at gap-time ", GAP_AT,
+                          " games (covariate effects held equal)"))
+
+esc2 <- pwp_base$`Relative to 1st spell`[pwp_base$Spell == "2nd"]
+esc3 <- pwp_base$`Relative to 1st spell`[pwp_base$Spell == "3rd+"]
+
+# Crude (unadjusted) rates for the same strata, so the prose can compare how much of
+# the escalation the covariates actually absorb.
+crude <- pwp %>% group_by(ep_order_capped) %>%
+  summarise(r = round(1000 * sum(event_recurrent) / n(), 1), .groups = "drop")
+crude_1st <- crude$r[crude$ep_order_capped == "1st"]
+crude_3rd <- crude$r[crude$ep_order_capped == "3rd+"]
+```
+
+Ten games after returning, and holding every workload, schedule and
+context covariate equal, a player in their second spell carries
+`r esc2`x the baseline hazard of a player in their first, and a player
+in their third or later spell carries `r esc3`x. The unadjusted picture
+is steeper still. Crude event rates go from `r crude_1st` per 1,000
+intervals in a first spell to `r crude_3rd` in a third, an escalation of
+`r round(crude_3rd / crude_1st, 1)`x against the `r esc3`x that survives
+adjustment. So the covariates do absorb a real share of it, roughly
+`r round(100 * (crude_3rd/crude_1st - esc3) / (crude_3rd/crude_1st))`%:
+players on their third injury of a season are carrying heavier workloads
+and worse schedules, and the model can see that. What it cannot see is
+the remaining `r esc3`x, which sits in the baseline where no covariate
+reaches it.
+
+That is the clearest statement this thesis can make of a finding the
+injury-epidemiology literature has reported repeatedly: previous injury
+is among the strongest predictors of the next one (Fulton et al. 2014;
+Hägglund et al. 2006), and in the NBA specifically Eftekhari et al.
+(2022) found that 81.4% of players who sustained a hamstring injury went
+on to sustain a subsequent injury in the same or following season. The
+practical reading is uncomfortable but simple: the single largest change
+in a player's risk profile is having already been injured once, and it
+is a change no amount of load management shows up as, because it is not
+carried by the load covariates at all.
 
 ```{r frailty, dependson=c("zscore","model-specs")}
 #a random intercept per player.
@@ -1197,12 +1112,10 @@ sd_frail <- sqrt(theta)
 frail_fit
 ```
 
-A theta on its own is uninterpretable: it says how much players differ in
-what I could not measure, but not how much of the original difference I
-managed to remove. So I refit the same frailty model with the covariate
-blocks added one at a time, starting from nothing. All four are fitted on
-the **same rows** (the complete cases the full model uses), otherwise the
-variances are not comparable.
+A θ on its own is uninterpretable: it says how much players differ in
+what I could not measure, not how much of the original difference I
+removed. So I refit with the blocks added one at a time from nothing,
+all on the same rows, otherwise the variances are not comparable.
 
 ```{r frailty-nested, dependson=c("zscore","model-specs")}
 # Common row set, so theta is comparable across specifications.
@@ -1236,7 +1149,7 @@ show_tbl(frailty_tab, paste0("Between-player heterogeneity as covariates are add
 ```
 
 ```{r recurrent-compare, dependson=c("ag-model","pwp","frailty")}
-headline <- c("z_ROLLING_LOAD_28D", "z_ROLLING_LOAD_7D", "z_ACWR_LOAD",
+headline <- c("z_ROLLING_LOAD_28D", "z_ROLLING_LOAD_7D",
               "z_ROLLING_GAMES_7D", "z_CAREER_GAMES_MISSED", "z_SEASONS_IN_LEAGUE",
               "z_TEAM_DAYS_REST", "z_IS_B2B", "z_PRIOR_EPISODES_SEASON", "RECENT_RETURN")
 
@@ -1258,76 +1171,103 @@ The headline workload effects hold their shape across all three, the
 chronic-load result is not an artefact of how I chose to handle
 recurrence.
 
-The frailty variance θ **=** `r round(theta, 3)` is the most interesting
+The frailty variance θ = `r round(theta, 3)` is the most interesting
 number in this section, but only once it is read against the baseline.
 With no covariates at all, θ is `r round(theta_steps[1], 3)`, which puts
 the 90th percentile of injury-proneness at
 `r round(exp(2 * qnorm(0.9) * sqrt(theta_steps[1])), 1)`x the hazard of
 the 10th. With the full covariate set that spread falls to
-`r round(exp(2 * qnorm(0.9) * sd_frail), 1)`x. **The model absorbs
-`r pct_absorbed`% of the between-player variance.**
+`r round(exp(2 * qnorm(0.9) * sd_frail), 1)`x. The model absorbs
+`r pct_absorbed`% of the between-player variance.
 
 Player context does most of that work, taking θ from
 `r round(theta_steps[3], 3)` to `r round(theta_steps[4], 3)`, more than
-workload and schedule combined. That is what should happen: career games
-missed, tenure and prior-episode history are *player-level* attributes,
-so they are the terms with any purchase on between-player differences.
-Workload moves around within a player across a season, so it was never
-going to absorb much of it.
+workload and schedule combined. Which is what should happen: career
+games missed, tenure and prior-episode history are player-level
+attributes, so they are the only terms with real purchase on
+between-player differences. Workload moves around within a player across
+a season.
 
-Worth putting the residual next to a measured effect rather than leaving
-it hanging. One SD of unmeasured proneness multiplies the hazard by
-`r round(exp(sd_frail), 2)`. One SD of chronic load multiplies it by
-`r hr(m3, "z_ROLLING_LOAD_28D")`. The largest thing I measure is bigger
-than the largest thing I miss. What remains is a genuine
-`r round(exp(2 * qnorm(0.9) * sd_frail), 1)`x spread that public data
-does not reach, and that is the honest limit rather than a failure.
+Worth setting the residual against something measured. One SD of
+unmeasured proneness multiplies hazard by `r round(exp(sd_frail), 2)`;
+one SD of chronic load by `r hr(m3, "z_ROLLING_LOAD_28D")`. The biggest
+thing I measure is bigger than the biggest thing I miss. What is left is
+a real `r round(exp(2 * qnorm(0.9) * sd_frail), 1)`x spread that public
+data does not reach, which is a limit rather than a failure.
 
-The instructive divergence is `CAREER_GAMES_MISSED`, which moves from
-1.11 under AG to 0.967 under frailty (essentially to null). That is not
-a contradiction, it is the two models answering different questions. AG
-is marginal (across the population, players with more career games
-missed are higher risk). Frailty is conditional (holding a player's own
-proneness fixed, their career games missed adds nothing). Both are true:
-career games missed is largely a *proxy* for the frailty term, so once
-frailty is estimated explicitly, the proxy has no work left to do.
+`CAREER_GAMES_MISSED` is the instructive divergence:
+`r compare$HR_AG[compare$term == "z_CAREER_GAMES_MISSED"]` under AG,
+`r compare$HR_frailty[compare$term == "z_CAREER_GAMES_MISSED"]` under
+frailty. Not a contradiction, two questions. AG is marginal (across the
+population, more games missed means higher risk); frailty is conditional
+(holding a player's own proneness fixed, it adds nothing). Career games
+missed is largely a proxy for the frailty term, so once frailty is
+estimated the proxy has no work left.
 
 ------------------------------------------------------------------------
 
-# Stage 5 - Mechanism, exposure and hazard trajectory
+# Stage 6 - Mechanism split and hazard trajectory {#stage6}
+
+Feeds article 2.6, 3.4 and 3.5. This is the identification strategy.
 
 This is the stage that tests my hypothesis hardest, and where I most
 expected to be wrong.
 
-The negative control. If workload genuinely *causes* injury, its effect
+The negative control. If workload genuinely causes injury, its effect
 should depend on injury type: strong for overuse injuries, weaker for
 injuries that are essentially random contact events. If instead workload
 predicts every injury type equally, including a finger fracture from a
 loose ball, then what I am measuring is not fatigue but exposure:
 high-load players are on court more, so more things happen to them.
 
-I split into three tiers rather than the obvious two, because my first
-attempt was contaminated and I had to redo it. I originally put all
-"traumatic" injuries in the control bucket, but ankle sprains were 42%
-of that bucket and are plainly load-related, and I had lumped stress
-fractures in with acute ones.
+The tiers are cut on mechanism, following the IOC consensus statement
+(Bahr et al. 2020), which asks for mechanism to be recorded as acute,
+repetitive, or a mix of the two, and explicitly warns against a simple
+sudden/gradual dichotomy.
 
-1.  **Soft tissue** - hamstring, calf/Achilles, quad, groin. Load
-    *should* drive this.
-2.  **Load-linked structural** - ACL/PCL, meniscus, ankle sprain, bone
-    stress. Load plausibly contributes; a lower-limb stress fracture is
-    almost by definition a load injury.
-3.  **Random impact** - finger, eye/face, concussion, dislocation. This
-    is the **clean control**. Load should have little effect here beyond
-    exposure.
+The repetitive tier is reported in **two columns**, and that split
+turned out to matter more than anything else in this stage. Only about a
+fifth of it is a pathology anyone actually named; the rest is symptom
+text. A column of four, then:
 
-I run the split on the **exact Model 3 specification** (one
-specification, three outcomes), so the tiers sit on identical footing
-and each tier's hazard ratios are directly comparable to the main Model
-3 table. (I originally also ran a separate minutes-vs-distance "which
-exposure predicts better" test here; that turned out to be the
-tracking-data artefact discussed below, so the exposure question is
-settled and this stage is purely the mechanism contrast.)
+1.  **Overuse, diagnosed** - a named overuse pathology: tendinopathy,
+    plantar fasciopathy, bursitis, stress fracture or stress reaction.
+    If accumulated workload causes injury, this is where the effect
+    belongs.
+2.  **Overuse, symptom only** - the same mechanism label, but the report
+    records only "soreness", "tightness" or "spasms" with no diagnosis
+    attached. Whether these are incident pathology or a precautionary
+    rest decision written down as soreness is exactly the question, and
+    keeping them separate is what lets the table answer it.
+3.  **Acute non-contact** - a discrete event that fatigue can plausibly
+    set up: strains, sprains, and non-contact tears. The IOC's "mixed"
+    case, an acute failure of a cumulatively loaded tissue.
+4.  **Acute impact** - external energy transfer: contusions,
+    lacerations, concussion, and fractures or dislocations at
+    contact-prone sites. Workload cannot cause a jammed finger or a
+    facial laceration, so this is the negative control.
+
+Only the overuse tier splits this way. My classifier sends all vague
+symptom text to "repetitive" by construction, so acute non-contact and
+acute impact are already about 95% named pathology and there is nothing
+to separate; splitting them would be a distinction without a difference,
+on strata far too small to fit.
+
+A null result on the control would support a causal reading of the
+workload effect. A positive result detects confounding. So the control
+is doing its job either way, and the reader should judge it on whether
+it can detect bias, not on whether it comes out empty.
+
+If injuries workload cannot cause are essentially pure exposure, then
+the impact column is an estimate of the exposure component itself, and
+any covariate that fails to exceed it is not showing anything I am
+entitled to call causal. The two ratio columns do that division.
+
+Contact versus non-contact is not always recoverable from a public
+injury report: an ankle sprain can be landing awkwardly or landing on
+someone's foot, and the report says only "Left Ankle; Sprain". I assign
+each episode on the balance of the recorded pathology and the site, so
+the control tier is indicative rather than exact.
 
 The trajectory. `basehaz()` reads the baseline hazard directly, telling
 me when in a season risk elevates for an average player, independent of
@@ -1335,10 +1275,12 @@ any covariate.
 
 ```{r mechanism, dependson=c("zscore","model-specs")}
 # Mechanism models use the EXACT Model 3 specification (m3_terms): one specification,
-# three outcomes, so the tier hazard ratios are directly comparable to Model 3's table
-# and to each other. (An earlier version added rolling + contemporaneous intensity here,
-# making this a superset of Model 3; intensity is now folded into Model 3 itself as the
-# prospective lag pair, so no separate mechanism specification is needed.)
+# four outcomes, so every column is directly comparable to Model 3 and to each other.
+#
+# The repetitive tier is split. 
+named_path <- !cox$INJURY_TISSUE %in% c("non_specific", "not_recorded")
+cox$ev_rep_named <- as.integer(cox$event_repetitive == 1 &  named_path)
+cox$ev_rep_vague <- as.integer(cox$event_repetitive == 1 & !named_path)
 
 fit_outcome <- function(outcome, terms) {
   coxph(as.formula(paste0("Surv(t_start, t_stop, ", outcome, ") ~ ",
@@ -1346,64 +1288,128 @@ fit_outcome <- function(outcome, terms) {
         data = cox, ties = "efron")
 }
 
-m_soft   <- fit_outcome("event_soft",   m3_terms)  # overuse
-m_load  <- fit_outcome("event_load",   m3_terms)  # load-linked structural
-m_impact <- fit_outcome("event_impact", m3_terms)  # random contact = control
-m_soft_load <- fit_outcome("event_soft_load_recurrent", m3_terms)  # random contact = control
+m_rep_named <- fit_outcome("ev_rep_named",     m3_terms)  # diagnosed overuse
+m_rep_vague <- fit_outcome("ev_rep_vague",     m3_terms)  # symptom report only
+m_load      <- fit_outcome("event_acute_nc",   m3_terms)  # acute non-contact
+m_impact    <- fit_outcome("event_acute_imp",  m3_terms)  # acute impact = the control
+m_soft      <- fit_outcome("event_repetitive", m3_terms)  # pooled, for the trajectory below
 
-m_soft_recurrent   <- fit_outcome("event_soft_recurrent",   m3_terms)  # overuse
-m_load_recurrent   <- fit_outcome("event_load_recurrent",   m3_terms)  # load-linked structural
-m_soft_load_recurrent <- fit_outcome("event_soft_load_recurrent", m3_terms)  # random contact = control
-m_impact_recurrent <- fit_outcome("event_impact_recurrent", m3_terms)  # random contact = control
+m_soft_recurrent   <- fit_outcome("event_repetitive_recurrent", m3_terms)
+m_load_recurrent   <- fit_outcome("event_acute_nc_recurrent",   m3_terms)
+m_impact_recurrent <- fit_outcome("event_acute_imp_recurrent",  m3_terms)
 
-# The whole model across the three tiers, not just the three load terms. The ratio
-# column is the point: it asks which covariates actually DISTINGUISH a load-relevant
-# injury from a contact injury. Only one of them does.
 mech_terms <- tribble(
   ~term,                     ~label,
   "z_ROLLING_LOAD_28D",      "Chronic load (28d)",
   "z_ROLLING_LOAD_7D",       "Acute load (7d)",
-  "z_ACWR_LOAD",             "Load spike (ACWR)",
   "z_PREV_2GAME_DISTANCE",   "In-game load, 2 games back",
   "z_PRIOR_EPISODES_SEASON", "Prior injury episodes",
   "z_CAREER_GAMES_MISSED",   "Career games missed",
   "IS_POST_ALLSTAR",         "Post-All-Star phase")
 
+mods <- list(m_rep_named, m_rep_vague, m_load, m_impact)
+nms  <- c("Overuse (diagnosed)", "Overuse (symptom only)", "Acute non-contact",
+          "Acute impact (control)")
+
+# Built as character throughout: the p-value / concordance / event rows appended below
+# are text, and bind_rows will not combine a numeric column with a character one.
+fmt2 <- function(x) sprintf("%.2f", x)
+
 mech_tab <- mech_terms %>%
-  mutate(`Soft-tissue`   = map_dbl(term, ~ hr(m_soft,   .x)),
-         `Load-linked`   = map_dbl(term, ~ hr(m_load,   .x)),
-         `Random-impact` = map_dbl(term, ~ hr(m_impact, .x)),
-         `Soft / impact` = round(`Soft-tissue` / `Random-impact`, 2)) %>%
-  select(` ` = label, `Soft-tissue`, `Load-linked`, `Random-impact`, `Soft / impact`)
+  mutate(!!nms[1] := map_dbl(term, ~ hr(m_rep_named, .x)),
+         !!nms[2] := map_dbl(term, ~ hr(m_rep_vague, .x)),
+         !!nms[3] := map_dbl(term, ~ hr(m_load,      .x)),
+         !!nms[4] := map_dbl(term, ~ hr(m_impact,    .x)),
+         `Diagnosed / control`   = .data[[nms[1]]] / .data[[nms[4]]],
+         `Non-contact / control` = .data[[nms[3]]] / .data[[nms[4]]]) %>%
+  select(` ` = label, all_of(nms), `Diagnosed / control`, `Non-contact / control`) %>%
+  mutate(across(-1, fmt2))
 
-# Bottom row: each model's overall discrimination (Harrell's C), so the HRs and the
-# ranking ability sit in one place.
-mech_tab <- bind_rows(mech_tab, tibble(
-  ` `             = "Concordance (C)",
-  `Soft-tissue`   = round(summary(m_soft)$concordance[1],   3),
-  `Load-linked`   = round(summary(m_load)$concordance[1],   3),
-  `Random-impact` = round(summary(m_impact)$concordance[1], 3),
-  `Soft / impact` = NA_real_
-), tibble(
-  ` `             = "Events",
-  `Soft-tissue`   = sum(cox$event_soft),
-  `Load-linked`   = sum(cox$event_load),
-  `Random-impact` = sum(cox$event_impact),
-  `Soft / impact` = NA_real_
-))
+acute_p <- map_chr(mods, ~ fmt_p(summary(.x)$coefficients["z_ROLLING_LOAD_7D", "Pr(>|z|)"]))
 
-show_tbl(mech_tab, "Mechanism split - HR per SD (top rows) and model concordance (bottom row)")
+mech_tab <- bind_rows(
+  mech_tab,
+  tibble(` ` = "Acute load p-value", !!nms[1] := acute_p[1], !!nms[2] := acute_p[2],
+         !!nms[3] := acute_p[3], !!nms[4] := acute_p[4],
+         `Diagnosed / control` = NA_character_, `Non-contact / control` = NA_character_),
+  tibble(` ` = "Concordance (C)",
+         !!nms[1] := as.character(round(summary(m_rep_named)$concordance[1], 3)),
+         !!nms[2] := as.character(round(summary(m_rep_vague)$concordance[1], 3)),
+         !!nms[3] := as.character(round(summary(m_load)$concordance[1], 3)),
+         !!nms[4] := as.character(round(summary(m_impact)$concordance[1], 3)),
+         `Diagnosed / control` = NA_character_, `Non-contact / control` = NA_character_),
+  tibble(` ` = "Events",
+         !!nms[1] := as.character(sum(cox$ev_rep_named)),
+         !!nms[2] := as.character(sum(cox$ev_rep_vague)),
+         !!nms[3] := as.character(sum(cox$event_acute_nc)),
+         !!nms[4] := as.character(sum(cox$event_acute_imp)),
+         `Diagnosed / control` = NA_character_, `Non-contact / control` = NA_character_))
+
+show_tbl(mech_tab, "Mechanism split (IOC axis), benchmarked against the negative control")
 ```
 
-The bottom row adds each model's discrimination. The three are close,
-but **random-impact is the lowest** at
-`r round(summary(m_impact)$concordance[1], 3)`, below soft-tissue
-(`r round(summary(m_soft)$concordance[1], 3)`) and load-linked
-(`r round(summary(m_load)$concordance[1], 3)`). That's the direction the
-negative-control logic predicts: the model ranks the load-relevant
-injuries better than the random contact ones, because a random-impact
-injury, a jammed finger, a poke in the eye, is by definition the least
-driven by the workload, schedule and context the model is built from.
+The control fired, and that is the result. Chronic load returns
+`r hr(m_impact, "z_ROLLING_LOAD_28D")` on injuries workload cannot
+cause, which is larger than the
+`r hr(m_rep_named, "z_ROLLING_LOAD_28D")` it returns on diagnosed
+overuse, the injuries it is supposed to cause. A month of heavy load
+does not fracture a finger, so that
+`r hr(m_impact, "z_ROLLING_LOAD_28D")` cannot be fatigue. It is exposure
+and health selection: players carrying a heavy 28-day load are the ones
+on court when a loose ball or a stray elbow arrives, and they are
+carrying that load precisely because they were fit enough to keep being
+selected. Chronic load is therefore not something I can read causally at
+all, in any tier - the control tells me the whole of it could be
+exposure.
+
+Acute load is the exception, and splitting the overuse tier is what
+makes it visible. Where a pathology is actually named, acute load is the
+largest in the whole analysis (`r hr(m_rep_named, "z_ROLLING_LOAD_7D")`,
+p =
+`r fmt_p(summary(m_rep_named)$coefficients["z_ROLLING_LOAD_7D", "Pr(>|z|)"])`),
+larger even than for acute non-contact. Where the report says only that
+something is sore, it is flat (`r hr(m_rep_vague, "z_ROLLING_LOAD_7D")`,
+p =
+`r fmt_p(summary(m_rep_vague)$coefficients["z_ROLLING_LOAD_7D", "Pr(>|z|)"])`).
+Pooled, those two average out to something weak and ambiguous. Acute
+load is both largest and significant on the two tiers where fatigue can
+plausibly act, and both small and indistinguishable from zero on the
+symptom-only tier and on the control. The two together are what make the
+pattern read as specificity rather than noise.
+
+The load-overuse relationship is real, but only visible when the outcome
+is a diagnosed pathology rather than a symptom report. That is a finding
+about measurement as much as physiology, and it is the most practically
+useful thing in this section: a surveillance system built on
+availability text will understate the workload effect on overuse injury,
+because most of what it records as overuse is not a diagnosis. Two
+things support reading the symptom-only column as something other than
+incident pathology. Prior episodes stays strong in it
+(`r hr(m_rep_vague, "z_PRIOR_EPISODES_SEASON")`), so it tracks who the
+player is rather than what he did recently; and soreness is plausibly
+preceded by reduced load, since a player reporting it is already being
+managed, which biases its load coefficients toward null.
+
+Reading down the `Diagnosed / control` column, only two covariates clear
+the control at all. Acute load is the clear one
+(`r round(hr(m_rep_named,"z_ROLLING_LOAD_7D") / hr(m_impact,"z_ROLLING_LOAD_7D"), 2)`x
+the control), and prior injury episodes is the marginal one
+(`r round(hr(m_rep_named,"z_PRIOR_EPISODES_SEASON") / hr(m_impact,"z_PRIOR_EPISODES_SEASON"), 2)`x).
+The second is a modest excess, but it is in the right direction and it
+is the term least explicable as court time: how often a player has
+already broken down this season should not predict a jammed finger, and
+it barely does. Everything else in that column sits at or below 1.0,
+which is the honest reading - chronic load, in-game load two games back,
+career games missed and the post-All-Star phase all predict the control
+at least as strongly as they predict diagnosed overuse, so none of them
+survives as a fatigue effect.
+
+Discrimination follows the same ordering. Acute impact is lowest at
+`r round(summary(m_impact)$concordance[1], 3)`, below diagnosed overuse
+(`r round(summary(m_rep_named)$concordance[1], 3)`) and acute
+non-contact (`r round(summary(m_load)$concordance[1], 3)`), which is
+what the design predicts, though the spread is narrow enough that I
+would not lean on it alone.
 
 ```{r trajectory, dependson="mechanism", fig.height=4.5, fig.width=7.5}
 traj <- basehaz(m_soft, centered = FALSE) %>%
@@ -1431,211 +1437,48 @@ fig_traj
 
 ## What it shows
 
-The mechanism split is the most important result in the thesis, and it
-revises my hypothesis rather than simply confirming or refuting it. Read
-the table from the bottom row up.
-
-**The model ranks load-relevant injury better than contact injury.**
-Concordance is `r round(summary(m_soft)$concordance[1], 3)` for soft
-tissue and `r round(summary(m_load)$concordance[1], 3)` for load-linked
-structural injury, against
-`r round(summary(m_impact)$concordance[1], 3)` for the random-impact
-control. A model built from workload, schedule and player context sorts
-the injuries those things should govern better than the injuries they
-should not. That is the ordering the design predicts, and it is the first
-thing I want on the record.
-
-**Acute load is the only covariate in the model that tells the tiers
-apart.** It runs
-`r round(summary(m_soft)$conf.int["z_ROLLING_LOAD_7D", 1], 2)` for soft
-tissue and
-`r round(summary(m_load)$conf.int["z_ROLLING_LOAD_7D", 1], 2)` for
-load-linked structural injury, then falls to
-`r round(summary(m_impact)$conf.int["z_ROLLING_LOAD_7D", 1], 2)` for
-random impact. Nothing else in the model does that; every other term sits
-between 0.87 and 1.06 on the soft-to-impact ratio. Fatigue can tear a
-hamstring and cannot jam a finger, and exactly one covariate behaves
-accordingly.
-
-**Everything else is measuring exposure, and that is not a
-disappointment.** Chronic load returns its *highest* value in the control
-tier
-(`r round(summary(m_impact)$conf.int["z_ROLLING_LOAD_28D", 1], 2)`),
-which is what an exposure measure should do: a random-impact injury is
-close to a pure function of court time, since you have to be on the floor
-to be landed on. So the tightest load-to-injury relationship belongs
-where contact is the mechanism. I spent a while reading that as a failed
-negative control before realising it is the control working: it tells me
-which of my covariates are exposure measures and which are not.
-
-The honest summary is that the split **decomposes** the workload result
-rather than undermining it. There is an exposure component - chronic
-load, ACWR, career context, season phase - that raises the hazard of
-everything that can happen on a court. And there is a fatigue component -
-acute load - that only raises the hazard of what fatigue can cause. No
-pooled-outcome study can separate those two, because without a control
-tier they are observationally identical. That separation is the
-contribution.
-
-Worth noting the ACWR lands on the exposure side
-(`r round(summary(m_soft)$conf.int["z_ACWR_LOAD", 1], 2)` /
-`r round(summary(m_load)$conf.int["z_ACWR_LOAD", 1], 2)` /
-`r round(summary(m_impact)$conf.int["z_ACWR_LOAD", 1], 2)`), which is
-awkward for a measure the literature treats as a fatigue-spike proxy.
-
-A caution I want on the record. I originally saw soft-tissue concordance
-jump (0.693 → 0.744) when I first compared on-court distance to minutes,
-and read it as external load being a *better predictor*. It turned out
-to be a **tracking-data artefact**: DNP games carried a fake zero
-distance that the carry-forward then leaked into the injury rows (fixed
-in file 4). Corrected, load and minutes are **equivalent**, which is
-exactly why I can report load as my exposure (it is the better
-*construct*, what the body absorbed rather than what the coach chose)
-without it changing a single result, and keep minutes as the Stage 1
-robustness check. The lesson: distance is the right construct, but its
-apparent *advantage* over minutes was a bug, not a finding.
+The mechanism split is the most important result here, and it revises my
+hypothesis rather than confirming it. Splitting the workload effect by
+what the load could plausibly have caused separates an exposure
+component, chronic load and career context, which raises the hazard of
+everything including injuries load cannot cause, from a much narrower
+fatigue component, acute load, which appears only on injuries fatigue
+can actually produce. A pooled-outcome study reports the sum of those
+two and calls it a workload effect. Separating them is the contribution,
+and it is only possible because the outcome is classified on a mechanism
+axis rather than as one pooled definition.
 
 The trajectory is the clean dynamic finding. Per-game baseline hazard is
 `r sprintf("%.1f", late_rate / early_rate)` x steeper in games 55–75
 than games 5–25.
 
 Note: it is a property of the baseline hazard, not of any covariate
-coefficient, which is precisely why Stage 2 found no covariate drifting.
+coefficient, which is precisely why Stage 3 found no covariate drifting.
 The season gets more dangerous for everyone; it does not change how
 workload acts. Those are different claims and only the survival framing
 separates them.
 
-## Does the choice of time scale matter?
-
-Everything above runs on one time axis: the player's sequential position
-through their team's **scheduled** games. That is a modelling decision,
-not a fact about the data, and it is the sort of decision that usually
-goes unexamined in a counting-process model. So I tested the alternative.
-
-The competing clock counts a player's **at-risk intervals** instead,
-closing the gaps that injury absences leave behind. Under the scheduled
-clock, LeBron's first appearance in 2025-26 is game 15, because his team
-played 14 games while he was out. Under the at-risk clock it is game 1.
-The difference is not cosmetic: it changes which players sit in the same
-risk set. The scheduled clock compares players at the same point in the
-season; the at-risk clock compares players at the same number of
-available games.
-
-I did consider a third version, counting only games actually *played*,
-which is the most literal reading of "the player's own 82 games". It is
-not usable. Every event is the first *missed* game of an absence, so a
-games-played counter does not advance on the event row and all 3,257
-events collapse to zero-length intervals. Making it work would mean
-dropping rest days from the risk set, and those rows are deliberately
-there: they supply the low-load intervals that identify the workload
-effect.
-
-```{r clock-robustness, dependson=c("m3","mechanism")}
-cox_b <- cox %>% arrange(SEASON, PLAYER_ID, t_stop) %>%
-  group_by(SEASON, PLAYER_ID) %>%
-  mutate(b_stop = row_number(), b_start = b_stop - 1L) %>% ungroup()
-stopifnot(all(cox_b$b_stop > cox_b$b_start))
-
-fit_b <- function(outcome, terms = m3_terms) {
-  coxph(as.formula(paste0("Surv(b_start, b_stop, ", outcome, ") ~ ",
-        paste(terms, collapse = " + "), " + ", rhs_tail)),
-        data = cox_b, ties = "efron")
-}
-m3_b     <- fit_b("event")
-msoft_b  <- fit_b("event_soft");  mload_b <- fit_b("event_load")
-mimp_b   <- fit_b("event_impact")
-
-clock_tab <- tibble(
-  Quantity = c("Model 3: chronic load (28d)", "Model 3: acute load (7d)",
-               "Model 3: acute:chronic ratio", "Model 3: concordance",
-               "Soft-tissue: chronic / acute", "Load-linked: chronic / acute",
-               "Random-impact: chronic / acute"),
-  `Scheduled-game clock` = c(
-    hr(m3, "z_ROLLING_LOAD_28D"), hr(m3, "z_ROLLING_LOAD_7D"),
-    hr(m3, "z_ACWR_LOAD"), round(summary(m3)$concordance[1], 4),
-    paste(hr(m_soft,"z_ROLLING_LOAD_28D"),  "/", hr(m_soft,"z_ROLLING_LOAD_7D")),
-    paste(hr(m_load,"z_ROLLING_LOAD_28D"),  "/", hr(m_load,"z_ROLLING_LOAD_7D")),
-    paste(hr(m_impact,"z_ROLLING_LOAD_28D"),"/", hr(m_impact,"z_ROLLING_LOAD_7D"))),
-  `At-risk-interval clock` = c(
-    hr(m3_b, "z_ROLLING_LOAD_28D"), hr(m3_b, "z_ROLLING_LOAD_7D"),
-    hr(m3_b, "z_ACWR_LOAD"), round(summary(m3_b)$concordance[1], 4),
-    paste(hr(msoft_b,"z_ROLLING_LOAD_28D"), "/", hr(msoft_b,"z_ROLLING_LOAD_7D")),
-    paste(hr(mload_b,"z_ROLLING_LOAD_28D"), "/", hr(mload_b,"z_ROLLING_LOAD_7D")),
-    paste(hr(mimp_b,"z_ROLLING_LOAD_28D"),  "/", hr(mimp_b,"z_ROLLING_LOAD_7D"))))
-
-# How far apart are the two clocks in the first place?
-clock_gap <- cox_b %>% summarise(
-  `Rows where the clocks agree` = sprintf("%.1f%%", 100*mean(t_stop == b_stop)),
-  `Mean absolute difference`    = round(mean(abs(t_stop - b_stop)), 2),
-  `Largest difference`          = max(abs(t_stop - b_stop)))
-
-show_tbl(clock_tab, "Time-scale robustness: scheduled-game clock vs at-risk-interval clock")
-show_tbl(clock_gap, "How far apart the two clocks actually are")
-```
-
-## What it shows
-
-**Nothing moves.** Chronic load goes from
-`r hr(m3, "z_ROLLING_LOAD_28D")` to `r hr(m3_b, "z_ROLLING_LOAD_28D")`,
-acute load from `r hr(m3, "z_ROLLING_LOAD_7D")` to
-`r hr(m3_b, "z_ROLLING_LOAD_7D")`, and concordance from
-`r round(summary(m3)$concordance[1], 4)` to
-`r round(summary(m3_b)$concordance[1], 4)`. The mechanism split is intact:
-acute load still collapses to
-`r hr(mimp_b, "z_ROLLING_LOAD_7D")` in the random-impact control under
-the at-risk clock while holding up in the two load-relevant tiers.
-
-I had expected chronic load to *fall* under the at-risk clock, on the
-reasoning that a clock counting available games would absorb some of the
-accumulated-exposure signal the covariate is carrying. It does not; if
-anything it rises marginally. The second table explains why: the two
-clocks agree on
-`r clock_gap[["Rows where the clocks agree"]]` of rows and differ by
-`r clock_gap[["Mean absolute difference"]]` games on average. Injury
-absences are neither frequent nor long enough to reshape the risk sets.
-
-The one covariate that does move is season progress, which is a
-redistribution rather than a finding: once the clock stops tracking
-calendar position, the covariate measuring calendar position picks up the
-slack.
-
-I keep the scheduled-game clock as primary. It is the axis on which the
-baseline hazard has a season interpretation, which is what Stage 5's
-trajectory result rests on, and it is the axis that puts players
-available on the *same night* in the same risk set, which is the
-comparison a team actually makes. But the estimates do not depend on that
-choice, and that is worth knowing.
-
 ------------------------------------------------------------------------
 
-# Stage 6 - Out-of-sample validation
+# Stage 7 - Out-of-sample validation {#stage7}
 
-Everything above reports apparent performance, the model scored on the
-same data it was fitted to, which is optimistic by construction. A model
-with `r length(coef(m3))` covariates has ample opportunity to fit noise.
-So I hold data out and score the frozen model on rows it has never seen,
-two complementary ways:
+Feeds article 2.7 and 3.7.
 
--   **Temporal split**: train on 2021-22 … 2024-25, test on 2025-26.
-    This is the operational question: trained on past seasons, does it
-    work on a future one? It is how a rolling risk tool would actually
-    be operationalised.
--   **Player-grouped 5-fold CV**: each fold holds out whole *players*.
-    This is the fair test for repeated-measures data. A naive random row
-    split would put LeBron's game 5 in training and his game 6 in test,
-    and the model would score well by having memorised him rather than
-    by having learned anything general.
+Everything above is apparent performance, scored on the data it was
+fitted to, which is optimistic by construction. `r length(coef(m3))`
+covariates is ample opportunity to fit noise. Two hold-outs, chosen
+because they fail differently:
 
-Two Notes on the training data:
+-   Temporal split: train 2021-22 to 2024-25, test 2025-26. The
+    operational question, and how a rolling tool would actually run.
+-   Player-grouped 5-fold CV: whole players held out. A random row split
+    would put LeBron's game 5 in training and game 6 in test, so the
+    model could score well by memorising him.
 
-1.  Z-scores are computed on training rows only and then applied to test
-    rows. Scaling on the pooled data would leak the test distribution
-    into training.
-2.  `strata(SEASON)` is dropped here. A stratified model has no baseline
-    for a season it never saw, so it could not score 2025-26 at all.
-    Discrimination only needs the linear predictor Xβ, which requires no
-    baseline, so a common-baseline fit is both sufficient and necessary
-    here.
+Two safeguards: z-scores computed on training rows only, otherwise the
+test distribution leaks into training; and `strata(SEASON)` dropped,
+because a stratified model has no baseline for a season it never saw and
+discrimination needs only the linear predictor.
 
 ```{r validation-setup, dependson="model-specs"}
 zcols <- c("ROLLING_MIN_7D","ROLLING_MIN_28D","ACWR_MIN","ROLLING_GAMES_7D",
@@ -1651,10 +1494,10 @@ zcols <- c("ROLLING_MIN_7D","ROLLING_MIN_28D","ACWR_MIN","ROLLING_GAMES_7D",
 # primary = the reported load model; minutes = the same spec with minutes swapped in,
 # validated out of sample as the robustness check (both on the new-injury outcome).
 specs <- list(
-  primary = list(outcome = "event", terms = c(paste0("z_", c("ROLLING_LOAD_7D","ROLLING_LOAD_28D","ACWR_LOAD","ROLLING_GAMES_7D","PREV_GAME_DISTANCE","PREV_2GAME_DISTANCE")),
+  primary = list(outcome = "event", terms = c(paste0("z_", c("ROLLING_LOAD_7D","ROLLING_LOAD_28D","ROLLING_GAMES_7D","PREV_GAME_DISTANCE","PREV_2GAME_DISTANCE")),
                                               "z_ROLLING_DIST_7D","z_ROLLING_DIST_28D","z_SEASON_CUMULATIVE_DIST",
                                               schedule_added, context_added)),
-  minutes = list(outcome = "event", terms = c(paste0("z_", c("ROLLING_MIN_7D","ROLLING_MIN_28D","ACWR_MIN","ROLLING_GAMES_7D","PREV_GAME_MIN","PREV_2GAME_MIN")),
+  minutes = list(outcome = "event", terms = c(paste0("z_", c("ROLLING_MIN_7D","ROLLING_MIN_28D","ROLLING_GAMES_7D","PREV_GAME_MIN","PREV_2GAME_MIN")),
                                               "z_ROLLING_DIST_7D","z_ROLLING_DIST_28D","z_SEASON_CUMULATIVE_DIST",
                                               schedule_added, context_added))
 )
@@ -1748,55 +1591,45 @@ show_tbl(validation_summary, "Validation summary - apparent vs two out-of-sample
 
 ## What it shows
 
-The gap is roughly **0.01 of concordance** on both models and under both
-schemes. That is small, it says the model is not overfitted, and that
-its apparent performance is close to what it would deliver on genuinely
-new data.
+The out-of-sample estimates land essentially on top of the apparent one.
+The largest drop under either scheme is
+`r sprintf("%.3f", max(validation_summary$apparent_C - validation_summary$temporal_C, validation_summary$apparent_C - validation_summary$player_cv_C))`
+of concordance, and on the temporal split the held-out season actually
+scores marginally higher than the training data. There is no detectable
+optimism here: apparent performance is what this model would deliver on
+data it has never seen. Both schemes agreeing matters, since the
+temporal split would expose a model that only worked in its training
+seasons and the player-grouped CV would expose one that had memorised
+players.
 
-Both out-of-sample schemes need to both return similar conclusions,
-because they fail in different ways. The temporal split would expose a
-model that only worked in the seasons it was trained on; the
-player-grouped CV would expose one that had memorised specific players.
-
-The `minutes` robustness spec lands right on top of the primary (load)
-model out of sample - the held-out concordances are identical (see the
-table). So the exposure choice, load or minutes, makes no difference to
-how the model generalises, which is what I'd expect given they are
-\~0.99 collinear.
-
-Out-of-sample calibration holds too, observed injury rates in the
-held-out season still climb across risk bands built from the frozen
-model. The ranking transfers.
+The minutes spec lands on top of the load model out of sample, so the
+exposure choice makes no difference to generalisation. Out-of-sample
+calibration holds too: injury rates still climb across risk bands built
+from the frozen model. The ranking transfers.
 
 ------------------------------------------------------------------------
 
-# Stage 7 - Rolling injury-risk profiles (the applied deliverable)
+# Stage 8 - Rolling risk profiles {#stage8}
 
-Everything so far is population-level, hazard ratios, discrimination,
-validation. But the thesis set out (§1.7, Aim 1) to build something
-operational, a *rolling* profile that captures not just *whether* a
-player is at risk but *when* and *why*. This stage turns Model 3 into
-that tool.
+Feeds article 3.7, Figure 4 and Tables 8-9. The applied deliverable.
 
-The mechanics are simple. Model 3's linear predictor is a
-per-player-per-game **risk score** (higher = higher hazard) - the same
-quantity I calibrated in Stage 3. Plotted over a season it becomes a
-trajectory. To make the reading *relative* rather than an
-uninterpretable log-hazard number, I overlay the **league risk-set
-distribution** at each game number: the median and inter-quartile range
-of the score across everyone playing their n-th game of the season. A
-line above the band means the player is carrying more modelled risk than
-a typical player at that point in the season; the shape shows when.
+Model 3's linear predictor is a per-player-per-game risk score, the same
+quantity calibrated in Stage 3. Plotted over a season it becomes a
+trajectory. To make it read as relative rather than an uninterpretable
+log-hazard, I overlay the league median and IQR at each game number.
+Above the band means more modelled risk than a typical player at that
+point; the shape shows when.
 
-I use **Model 3** (the primary, validated model) on **2025-26** - the
-held-out season, so these are genuinely prospective scores - and pick
-three exemplars to span the range: LeBron James as the familiar anchor,
-one player the model rates well above the league, and one it rates
-below. The test is conceptual: does each profile match what we
-independently know about that player's durability and availability?
+I use Model 3 (the primary, validated model) on 2025-26 - the held-out
+season, so these are genuinely prospective scores - and pick three
+exemplars to span the range: LeBron James as the familiar anchor, one
+player the model rates well above the league, and one it rates below.
+The test is conceptual: does each profile match what we independently
+know about that player's durability and availability?
 
 ```{r risk-profiles, dependson="m3", fig.height=8.5, fig.width=8}
 TEST <- "2025-26"
+attr(m3$terms, ".Environment") <- environment()   # see the note in the calibration chunk
 cox$risk_lp <- as.numeric(predict(m3, newdata = cox, type = "lp"))
 season <- cox %>% filter(SEASON == TEST, !is.na(risk_lp))
 
@@ -1879,71 +1712,438 @@ fig_profiles
 
 ## What it shows
 
-The quintile table above is the general claim: player-level mean risk
-score orders injury count across the season (Spearman rho =
-`r round(rho_events, 2)`), so the three profiles below illustrate a real
+The quintile table is the general claim: player-level mean risk score
+orders injury count across the season (Spearman rho =
+`r round(rho_events, 2)`), so the three profiles illustrate a real
 relationship rather than standing in for one.
 
-Two of the three line up, and the third is a miss worth showing.
-**Jalen Johnson** sits above the league IQR for essentially the whole
-season (`r get_stat("Jalen Johnson", "% games above league median")`% of
-his games above the median) and records
-`r get_stat("Jalen Johnson", "Injury events")` separate injury onsets,
-the highest burden in the season. **Jamal Shead** runs along the bottom
-of the band, unbroken across
-`r get_stat("Jamal Shead", "Games played")` games, and never records an
-injury.
+Two of three line up. Jalen Johnson sits above the IQR essentially all
+season (`r get_stat("Jalen Johnson", "% games above league median")`%)
+with `r get_stat("Jalen Johnson", "Injury events")` onsets, the season's
+highest burden. Jamal Shead runs along the bottom unbroken with none.
+LeBron James is the miss: average-risk read,
+`r get_stat("LeBron James", "Injury events")` onsets. At concordance
+`r round(summary(m3)$concordance[1], 2)` about one pair in three is
+ordered wrongly, so a three-player figure has no right to be immune.
 
-**LeBron James** is where the model gets it wrong, and I want that on the
-page rather than glossed. He oscillates around the median, an
-average-risk read, yet records
-`r get_stat("LeBron James", "Injury events")` injury onsets against
-Shead's `r get_stat("Jamal Shead", "Injury events")`. The reason is
-visible in the covariates. James's load and schedule profile through
-2025-26 is unremarkable, so a model built from workload and schedule has
-nothing to flag; what makes him fragile at 40 is age and accumulated
-career mileage, which the tenure terms only coarsely capture, plus the
-soft-tissue history that public data does not resolve.
+A note on what these profiles are scored against. The instinct is to
+validate against games missed, and that is the wrong target. Across the
+`r nrow(player_lvl)` players with 40+ modelled intervals in `r TEST`,
+mean risk score correlates with games missed at Spearman
+`r round(rho_missed, 2)`, negative: higher-scoring players miss fewer
+games, because a high score requires high load and high load requires
+being available. Games missed mixes injury with rest, load management
+and coaching decisions. Onsets are what the model is fitted to.
 
-**A note on what these profiles are scored against.** The natural
-instinct is to validate a risk profile against games missed, and that is
-the wrong target. Across all `r nrow(player_lvl)` players with 40 or more
-modelled intervals in `r TEST`, mean risk score correlates with games
-missed at Spearman
-`r round(rho_missed, 2)`. The sign is negative: higher-scoring players
-miss *fewer* games, because a high score requires high load and high load
-requires being available in the first place. Games missed mixes injury with rest, load management and coaching
-decisions. Injury onsets are what the model is fitted to, and they are
-what these profiles are judged on.
+Two caveats. The score is relative, so it ranks but gives no absolute
+probability. And even Shead, low-risk , sits only modestly below the
+median, which is the health-selection wall made visual: you cannot post
+a very low load-based score and play a full season, because availability
+is what drives the load the score is built from. The lowest scores in
+the league belong to players barely in the rotation.
 
-This is what a concordance of
-`r round(summary(m3)$concordance[1], 2)` *means* at the individual
-level. The model orders roughly two comparable intervals in three
-correctly, so about one pair in three is ordered wrongly, and a
-three-player figure has no right to be immune from that. A risk profile
-that flags its own miss is a more honest description of the tool than
-one built from three players who all happen to agree with it.
-
-Two honest caveats. First, the score is **relative**: it ranks, it does
-not give an absolute probability - the `strata(SEASON)` design means
-there is no single baseline hazard to attach one to. Second, and more
-telling, even Shead - my *low-risk* exemplar - sits only modestly below
-the median. That is the health-selection wall from Stage 5 made visual:
-a player cannot post a very low load-based risk score *and* play a full
-season, because availability is exactly what drives the load the score
-is built from. The genuinely lowest scores in the league belong to
-players barely in the rotation. A profile that is both low-risk and
-high-availability is about the best a durable player can look, not a
-dramatically empty one.
-
-The *why* lives inside the same object. Because the score is a weighted
-sum of the covariates, a player's elevation on any given game decomposes
-into how much comes from acute load, schedule congestion, or
-prior-injury history - the per-player readout a practitioner would
-actually act on. Stage 5 is the population-level version of that same
-question.
+The why lives in the same object. The score is a weighted sum, so a
+player's elevation on any game decomposes into how much comes from acute
+load, congestion or injury history, which is the per-player readout a
+practitioner would act on.
 
 ------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+Where I got to, and what carries into the article.
+
+1.  The mechanism split decomposes workload into exposure and fatigue.
+    Chronic load predicts every tier at similar strength, and returns
+    its *lowest* value on diagnosed overuse
+    (`r hr(m_rep_named, "z_ROLLING_LOAD_28D")`) against
+    `r hr(m_impact, "z_ROLLING_LOAD_28D")` on injuries it cannot
+    possibly cause. That ordering is backwards for a fatigue mechanism
+    and exactly right for an exposure measure, and for a contact injury
+    exposure *is* the causal route. Acute load is the covariate that
+    tells the tiers apart, and only once chronic load is held fixed,
+    which is what turns it from a volume proxy into a measure of how
+    recently that volume arrived. Both components are real and no
+    pooled-outcome study can separate them. That separation is the
+    contribution.
+
+2.  The fatigue signal is acute load, and it is **specific rather than
+    small**. It is the largest effect in the analysis on diagnosed
+    overuse (`r hr(m_rep_named, "z_ROLLING_LOAD_7D")`, p =
+    `r fmt_p(summary(m_rep_named)$coefficients["z_ROLLING_LOAD_7D", "Pr(>|z|)"])`)
+    and on acute non-contact injury
+    (`r hr(m_load, "z_ROLLING_LOAD_7D")`), and indistinguishable from no
+    effect on the control (`r hr(m_impact, "z_ROLLING_LOAD_7D")`, p =
+    `r fmt_p(summary(m_impact)$coefficients["z_ROLLING_LOAD_7D", "Pr(>|z|)"])`).
+    Size and significance agree, which is what makes it read as
+    specificity rather than noise. This is not the monotone fade across
+    tiers I expected and reported earlier; it is sharper than that.
+
+3.  The load-overuse relationship is only visible when the outcome is a
+    **diagnosed pathology**. Where a pathology is named, acute load is
+    `r hr(m_rep_named, "z_ROLLING_LOAD_7D")`. Where the report says only
+    that something is sore, it is
+    `r hr(m_rep_vague, "z_ROLLING_LOAD_7D")` on
+    `r format(sum(cox$ev_rep_vague), big.mark = ",")` events, a
+    well-powered null rather than a thin one. Pooling them hides both.
+    That is a finding about measurement as much as physiology: injury
+    surveillance built on availability text will understate the workload
+    effect on overuse injury, because most of what such data records as
+    overuse is not a diagnosis.
+
+4.  Prior injury is the largest change in a player's risk profile, and
+    the covariates do not carry it. Holding workload, schedule and
+    context equal, a player in their second injury spell of a season
+    carries `r esc2`x the baseline hazard of a player in their first and
+    a third-or-later spell `r esc3`x. Because the spell strata take no
+    coefficient, none of that is attributable to load; it sits in the
+    baseline, where no amount of load management would show it.
+
+5.  Load is interchangeable with minutes, and catching why mattered. I
+    report load as the better construct, and the model holds identically
+    on minutes. An earlier version had load out-predicting minutes for
+    soft tissue (0.693 → 0.744); that was a tracking-data bug, DNP games
+    leaking a fake zero distance through the carry-forward, not a real
+    edge. Distance is the right idea, but in public data total load ≈
+    minutes (r ≈ 0.99) and the injurious high-speed component is
+    unobserved.
+
+6.  The season's danger is in the baseline, not the coefficients.
+    Baseline hazard `r sprintf("%.1f", late_rate / early_rate)`x steeper
+    late season while covariate effects stay proportional. Heavy chronic
+    load is equally bad in October and April; the background rises.
+
+7.  Proneness is real, and the covariates absorb two thirds of it. θ =
+    `r round(theta, 3)` against `r round(theta_steps[1], 3)` unadjusted,
+    so the 90th-to-10th spread narrows from
+    `r round(exp(2 * qnorm(0.9) * sqrt(theta_steps[1])), 1)`x to
+    `r round(exp(2 * qnorm(0.9) * sd_frail), 1)`x. What remains is the
+    reach of public data.
+
+## Limitations
+
+-   Health-gating is not solved. Point-in-time rest and back-to-back
+    covariates read protective because coaches rest at-risk players. I
+    mark them rather than interpret them; observational data cannot
+    remove the bias.
+-   The outcome is availability, not diagnosis. "Listed Out with a
+    reason", not a clinician's assessment, and the reason text is
+    inconsistent.
+-   Concordance `r sprintf("%.2f", summary(m3)$concordance[1])` to
+    `r sprintf("%.2f", summary(m3_ag)$concordance[1])` is the
+    public-data ceiling. No GPS, no medical screening, no training load.
+    Better framed as establishing that ceiling than as a competitive
+    predictor.
+-   The lagged terms cost coverage. First two appearances each season
+    cannot be scored, so the model fits
+    `r format(m3$nevent, big.mark = ",")` of
+    `r format(sum(cox$event), big.mark = ",")` events. Early-season
+    injury is the blind spot, and a fair price for a correctly-signed
+    prospective term.
+-   The deep bench adds uninformative at-risk time, but excluding on
+    this season's games played would condition on the outcome.
+-   Intensity is a per-game distance-per-minute average, which cannot
+    resolve high-speed and acceleration efforts. Its null is evidence
+    about this measure, not the construct.
+-   Mechanism tiers involve judgement. Regex on free text; defensible
+    but not uniquely so.
+-   Five seasons, one league, two COVID-affected.
+
+# Appendix - Robustness and sensitivity checks {#appendix}
+
+Checks that the headline result does not depend on a modelling choice I
+made. Each re-fits the reported specification with one decision changed
+and reports what moves. They sit here rather than in the main sequence
+because none of them changes a conclusion; the point of each is that
+nothing happens.
+
+------------------------------------------------------------------------
+
+## Does the exposure choice matter?
+
+Load and minutes are \~`r round(r_load_min, 3)` collinear, so does the
+choice matter? Refitting Model 3 with minutes swapped in leaves
+discrimination and the headline hazard ratios essentially unchanged.
+
+```{r robustness-minutes, dependson="model-specs"}
+m3_min <- fit_cox(m3_terms_min)   # same Model 3, minutes in place of load
+
+robust_tab <- tibble(
+  Metric = c("Concordance", "Chronic workload HR (per SD)",
+             "Acute workload HR (per SD)"),
+  `Load (reported)` = c(
+    round(summary(m3)$concordance[1], 4),
+    hr(m3, "z_ROLLING_LOAD_28D"), hr(m3, "z_ROLLING_LOAD_7D")),
+  `Minutes (robustness)` = c(
+    round(summary(m3_min)$concordance[1], 4),
+    hr(m3_min, "z_ROLLING_MIN_28D"), hr(m3_min, "z_ROLLING_MIN_7D"))
+)
+show_tbl(robust_tab, "Robustness - on-court load vs minutes give the same answer")
+```
+
+So the exposure choice is not driving the result. I lead with load
+because it is the better construct, what the body absorbed rather than
+what the coach decided.
+
+## Is the 2-games-back term its own signal?
+
+Lag-2 carries correctly-signed load effect in the model. Two ways it
+could be an illusion: it might just be re-expressing the 7d/28d rolling
+windows, or its contribution might be in-sample overfitting.
+
+```{r sensitivity-lag2, dependson="model-specs"}
+load_block <- c("z_ROLLING_LOAD_7D", "z_ROLLING_LOAD_28D")
+
+# How much of lag-2 do the rolling windows explain? VIF < 5 = estimable alongside them.
+lag2_vif <- 1 / (1 - summary(lm(z_PREV_2GAME_DISTANCE ~ z_ROLLING_LOAD_7D +
+                   z_ROLLING_LOAD_28D, data = cox))$r.squared)
+
+# Out of sample: refit on 2021-25, score the unseen 2025-26, with and without lag-2.
+tr <- cox %>% filter(SEASON != "2025-26"); te <- cox %>% filter(SEASON == "2025-26")
+oos_c <- function(terms) {           # no season strata, so the score transfers
+  f <- coxph(as.formula(paste0(surv_lhs, " ~ ", paste(terms, collapse = " + "),
+                               " + cluster(PLAYER_ID)")), data = tr, ties = "efron")
+  d <- te; d$.lp <- as.numeric(predict(f, newdata = te, type = "lp"))
+  round(concordance(Surv(t_start, t_stop, event) ~ .lp, data = d, reverse = TRUE)$concordance, 4)
+}
+
+oos_with <- oos_c(m3_terms)
+oos_less <- oos_c(setdiff(m3_terms, "z_PREV_2GAME_DISTANCE"))
+
+lag2_tab <- tibble(
+  Check = c("VIF of lag-2 against the rolling-load block",
+            "Out-of-sample C, lag-2 in the model",
+            "Out-of-sample C, lag-2 dropped"),
+  Value = c(round(lag2_vif, 2),
+            oos_with, oos_less))
+show_tbl(lag2_tab, "Is the 2-games-back term its own signal?")
+```
+
+VIF is inside the conventional threshold of 5, so lag-2 is estimable
+alongside the rolling windows. I
+
+What justifies keeping it is the hold-out: concordance `r oos_with` with
+lag-2 against `r oos_less` without. It adds predictive value on a season
+the model never saw, which is the test that matters for a term I report
+as a finding.
+
+## Does intensity add anything beyond volume?
+
+Load and minutes are both volume. Intensity is the obvious candidate for
+what they miss: how hard, not how long. It is nearly uncorrelated with
+the load terms, so if it carried independent signal this is where it
+would show. I add the same prospective lag pair to Model 3 and test
+whether both terms are jointly zero.
+
+```{r robustness-intensity, dependson="model-specs"}
+# Fit on the rows where intensity is defined for BOTH models, so the comparison is like for like (intensity needs >=10 minutes played, so it is missing more often than load).
+need_int <- c(setdiff(m3_terms, "I(z_SEASONS_IN_LEAGUE^2)"), intensity_terms)
+cox_int  <- cox %>% filter(if_all(all_of(need_int), ~ !is.na(.)))
+
+m3_int_base <- coxph(as.formula(paste0(surv_lhs, " ~ ", paste(m3_terms, collapse = " + "),
+                     " + ", rhs_tail)), data = cox_int, ties = "efron")
+m3_int_plus <- coxph(as.formula(paste0(surv_lhs, " ~ ",
+                     paste(c(m3_terms, intensity_terms), collapse = " + "),
+                     " + ", rhs_tail)), data = cox_int, ties = "efron")
+
+# Joint robust Wald test that both intensity coefficients are zero.
+cf <- coef(m3_int_plus); V <- vcov(m3_int_plus); idx <- match(intensity_terms, names(cf))
+int_wald <- as.numeric(t(cf[idx]) %*% solve(V[idx, idx]) %*% cf[idx])
+int_p    <- pchisq(int_wald, length(idx), lower.tail = FALSE)
+
+intensity_tab <- tibble(
+  Metric = c("Concordance", "Chronic load HR (per SD)", "Acute load HR (per SD)",
+             "In-game intensity, last game (per SD)", "In-game intensity, 2 games back (per SD)"),
+  `Model 3` = c(round(summary(m3_int_base)$concordance[1], 4),
+                hr(m3_int_base, "z_ROLLING_LOAD_28D"), hr(m3_int_base, "z_ROLLING_LOAD_7D"), NA, NA),
+  `+ intensity` = c(round(summary(m3_int_plus)$concordance[1], 4),
+                hr(m3_int_plus, "z_ROLLING_LOAD_28D"), hr(m3_int_plus, "z_ROLLING_LOAD_7D"),
+                hr(m3_int_plus, "z_PREV_GAME_INTENSITY"), hr(m3_int_plus, "z_PREV_2GAME_INTENSITY"))
+)
+show_tbl(intensity_tab, paste0("Intensity robustness - joint Wald test that both intensity terms are zero: p = ",
+                               fmt_p(int_p)))
+```
+
+Intensity adds nothing once volume is accounted for. Concordance
+unchanged to three decimals, load hazard ratios unmoved, both intensity
+terms close to 1.
+
+These players all move at broadly similar rates, so a per-SD move in
+intensity is a small physical change. This is evidence that the narrow
+band of intensity visible in public tracking data carries no signal
+beyond volume, not that effort is irrelevant. The high-speed and
+acceleration component the literature implicates is not resolvable in a
+per-game distance-per-minute average. Intensity stays out of the primary
+model.
+
+## Does the deep bench dilute the result?
+
+The sample is every player who appeared at all, including the very end
+of the rotation: 1-to-20-game seasons, single-digit minutes. Their
+availability is driven by roster politics more than health, so they add
+at-risk time that is largely noise. About 23% of player-seasons and 11%
+of rows, but under 5% of events, which is the profile of observations
+that dilute rather than inform.
+
+A player appears in few games precisely because he got hurt, so
+filtering on current availability deletes the injured and biases the
+effect toward null. That is conditioning on a post-baseline outcome.
+Instead the cohort is defined ex ante on the previous season's minutes
+per game, fixed before any of this season's injuries.
+
+```{r sensitivity-rotation, dependson="model-specs"}
+ROTATION_MPG <- 15   # prior-season minutes per game: an established rotation player
+
+rot_groups <- cox %>%
+  mutate(Group = case_when(
+    is.na(PRIOR_SEASON_MIN_PG)              ~ "No prior-season record",
+    PRIOR_SEASON_MIN_PG >= ROTATION_MPG     ~ paste0("Rotation (>= ", ROTATION_MPG, " mpg)"),
+    TRUE                                    ~ paste0("Below threshold (< ", ROTATION_MPG, " mpg)"))) %>%
+  group_by(Group) %>%
+  summarise(`Intervals` = n(), Events = sum(event),
+            `Events per 1,000 intervals` = round(1000 * sum(event) / n(), 2), .groups = "drop")
+show_tbl(rot_groups, "Event rate by prior-season role (the dilution, quantified)")
+
+rate_of  <- function(pat) rot_groups[["Events per 1,000 intervals"]][grepl(pat, rot_groups$Group)]
+rate_low <- rate_of("Below"); rate_rot <- rate_of("Rotation"); rate_na <- rate_of("No prior")
+n_noprior <- cox %>% distinct(SEASON, PLAYER_ID, .keep_all = TRUE) %>%
+  summarise(n = sum(is.na(PRIOR_SEASON_MIN_PG))) %>% pull(n)
+
+# season's injuries occur and the cohort stays ex ante.
+cox <- cox %>%
+  mutate(CAREER_MPG     = if_else(CAREER_GAMES > 0, CAREER_MINUTES / CAREER_GAMES, NA_real_),
+         ROTATION_BASIS = coalesce(PRIOR_SEASON_MIN_PG, CAREER_MPG))
+
+n_restored <- cox %>% distinct(SEASON, PLAYER_ID, .keep_all = TRUE) %>%
+  summarise(n = sum(is.na(PRIOR_SEASON_MIN_PG) & ROTATION_BASIS >= ROTATION_MPG, na.rm = TRUE)) %>%
+  pull(n)
+
+cox_rot <- cox %>% filter(ROTATION_BASIS >= ROTATION_MPG)
+m3_rot  <- coxph(as.formula(paste0(surv_lhs, " ~ ", paste(m3_terms, collapse = " + "),
+                 " + ", rhs_tail)), data = cox_rot, ties = "efron")
+
+rot_tab <- tibble(
+  Metric = c("Player-intervals (n)", "Events", "Concordance",
+             "Chronic load HR (per SD)", "Acute load HR (per SD)",
+             "In-game load, last game", "In-game load, 2 games back"),
+  `All players (primary)` = c(m3$n, m3$nevent, round(summary(m3)$concordance[1], 4),
+     hr(m3, "z_ROLLING_LOAD_28D"), hr(m3, "z_ROLLING_LOAD_7D"),
+     hr(m3, "z_PREV_GAME_DISTANCE"), hr(m3, "z_PREV_2GAME_DISTANCE")),
+  `Rotation players only` = c(m3_rot$n, m3_rot$nevent, round(summary(m3_rot)$concordance[1], 4),
+     hr(m3_rot, "z_ROLLING_LOAD_28D"), hr(m3_rot, "z_ROLLING_LOAD_7D"),
+     hr(m3_rot, "z_PREV_GAME_DISTANCE"), hr(m3_rot, "z_PREV_2GAME_DISTANCE"))
+)
+show_tbl(rot_tab, paste0("Sensitivity - restricted to established rotation players (>= ",
+                         ROTATION_MPG, " mpg in the prior season, or across their career ",
+                         "where the prior season is missing)"))
+```
+
+The workload result is not an artefact of the deep bench. Restricting to
+established rotation players raises the workload hazard ratios.
+Discrimination goes the other way.
+
+A more homogeneous cohort estimates the effects on a cleaner population
+while leaving less variation to rank. Full sample stays primary because
+it describes the league, not a subset.
+
+Filtering on prior-season minutes alone silently deletes the
+`r n_noprior` player-seasons with no prior-season record, because `NA`
+fails a `>=` test. The group is Klay Thompson, Kawhi Leonard, Jamal
+Murray, John Wall, Zion Williamson, all of whom missed a full season
+through injury. Dropping the highest injury-burden players in the league
+on a this would bias the check in the one direction . Where the prior
+season is missing I fall back to career minutes per game, restoring
+`r n_restored` player-seasons. Career totals use only seasons before the
+modelled one, so the cohort stays ex ante.
+
+I keep the full sample as primary (it is the honest population of NBA
+players and the broader claim) Rookies sit outside this check by
+construction: no prior season, no career history to fall back on.
+
+------------------------------------------------------------------------
+
+## Does the choice of time scale matter?
+
+Everything above runs on one time axis: the player's position through
+their team's scheduled games. That is a modelling decision, not a fact
+about the data, and it usually goes unexamined. So I tested the
+alternative.
+
+The competing clock counts a player's at-risk intervals, closing the
+gaps injury absences leave. LeBron's first 2025-26 appearance is game 15
+on the scheduled clock and game 1 on this one. Not cosmetic: it changes
+who sits in the same risk set. Scheduled compares players at the same
+point in the season, at-risk compares them at the same number of
+available games.
+
+```{r clock-robustness, dependson=c("m3","mechanism")}
+cox_b <- cox %>% arrange(SEASON, PLAYER_ID, t_stop) %>%
+  group_by(SEASON, PLAYER_ID) %>%
+  mutate(b_stop = row_number(), b_start = b_stop - 1L) %>% ungroup()
+stopifnot(all(cox_b$b_stop > cox_b$b_start))
+
+fit_b <- function(outcome, terms = m3_terms) {
+  coxph(as.formula(paste0("Surv(b_start, b_stop, ", outcome, ") ~ ",
+        paste(terms, collapse = " + "), " + ", rhs_tail)),
+        data = cox_b, ties = "efron")
+}
+m3_b     <- fit_b("event")
+msoft_b  <- fit_b("event_repetitive"); mload_b <- fit_b("event_acute_nc")
+mimp_b   <- fit_b("event_acute_imp")
+
+clock_tab <- tibble(
+  Quantity = c("Model 3: chronic load (28d)", "Model 3: acute load (7d)",
+               "Model 3: concordance",
+               "Repetitive: chronic / acute", "Acute non-contact: chronic / acute",
+               "Acute impact: chronic / acute"),
+  `Scheduled-game clock` = c(
+    hr(m3, "z_ROLLING_LOAD_28D"), hr(m3, "z_ROLLING_LOAD_7D"),
+    round(summary(m3)$concordance[1], 4),
+    paste(hr(m_soft,"z_ROLLING_LOAD_28D"),  "/", hr(m_soft,"z_ROLLING_LOAD_7D")),
+    paste(hr(m_load,"z_ROLLING_LOAD_28D"),  "/", hr(m_load,"z_ROLLING_LOAD_7D")),
+    paste(hr(m_impact,"z_ROLLING_LOAD_28D"),"/", hr(m_impact,"z_ROLLING_LOAD_7D"))),
+  `At-risk-interval clock` = c(
+    hr(m3_b, "z_ROLLING_LOAD_28D"), hr(m3_b, "z_ROLLING_LOAD_7D"),
+    round(summary(m3_b)$concordance[1], 4),
+    paste(hr(msoft_b,"z_ROLLING_LOAD_28D"), "/", hr(msoft_b,"z_ROLLING_LOAD_7D")),
+    paste(hr(mload_b,"z_ROLLING_LOAD_28D"), "/", hr(mload_b,"z_ROLLING_LOAD_7D")),
+    paste(hr(mimp_b,"z_ROLLING_LOAD_28D"),  "/", hr(mimp_b,"z_ROLLING_LOAD_7D"))))
+
+# How far apart are the two clocks in the first place?
+clock_gap <- cox_b %>% summarise(
+  `Rows where the clocks agree` = sprintf("%.1f%%", 100*mean(t_stop == b_stop)),
+  `Mean absolute difference`    = round(mean(abs(t_stop - b_stop)), 2),
+  `Largest difference`          = max(abs(t_stop - b_stop)))
+
+show_tbl(clock_tab, "Time-scale robustness: scheduled-game clock vs at-risk-interval clock")
+show_tbl(clock_gap, "How far apart the two clocks actually are")
+```
+
+## What it shows
+
+Nothing moves. Chronic load `r hr(m3, "z_ROLLING_LOAD_28D")` to
+`r hr(m3_b, "z_ROLLING_LOAD_28D")`, acute load
+`r hr(m3, "z_ROLLING_LOAD_7D")` to `r hr(m3_b, "z_ROLLING_LOAD_7D")`,
+concordance `r round(summary(m3)$concordance[1], 4)` to
+`r round(summary(m3_b)$concordance[1], 4)`. The mechanism split holds:
+acute load still collapses to `r hr(mimp_b, "z_ROLLING_LOAD_7D")` in the
+control.
+
+I had expected chronic load to fall, on the reasoning that a clock
+counting available games would absorb some of the exposure signal. It
+does not. The clocks agree on
+`r clock_gap[["Rows where the clocks agree"]]` of rows and differ by
+`r clock_gap[["Mean absolute difference"]]` games on average, so
+absences are not frequent enough to reshape the risk sets. Season
+progress moves, but that is redistribution.
+
+Scheduled clock stays primary. It is the axis where the baseline hazard
+has a season interpretation (Stage 6), and the one that puts players
+available on the same night in the same risk set, which is the
+comparison a team makes. The estimates do not depend on it, which is the
+useful part.
 
 ------------------------------------------------------------------------
 
@@ -2011,6 +2211,7 @@ write_tab(intensity_tab,           "table9b_intensity")
 write_tab(rot_tab,                 "table9c_rotation_cohort")
 write_tab(clock_tab,               "table9d_time_scale")
 write_tab(clock_gap,               "table9e_clock_gap")
+write_tab(lag2_tab,                "table9f_lag2_validation")
 # Appendix
 write_tab(zph3_tab,                "appendixA1_ph_full")
 write_tab(calib,                   "appendixA3_calibration_deciles")
@@ -2023,153 +2224,259 @@ tibble(Output = c(list.files(FIG, pattern = "\\.png$"),
   show_tbl("Files written for the article")
 ```
 
-# Conclusion
+# Presentation export {.unnumbered}
 
-**1. The mechanism split decomposes workload into exposure and fatigue.**
-Chronic load, ACWR and the context terms predict every injury tier at
-similar strength, which is what an exposure measure does: court time
-raises the hazard of everything that can happen out there, and for a
-contact injury exposure *is* the causal route. Acute load is the only
-covariate that tells the tiers apart. Both components are real, and no
-pooled-outcome study can separate them, because without a control tier
-they look identical. That separation is the contribution.
+Slide versions of the figures: fewer elements, much larger type, and one
+new figure that the article does not need. The negative control is a
+table in the article, but it is the centre of the talk, so it gets a
+purpose-built chart here. Everything writes to
+`docs/figures/presentation/`.
 
-**2. The genuine fatigue signal is acute load, and it is smaller.**
-Acute 7-day load fades across the injury tiers in the way a causal
-mechanism should.
+```{r presentation-export, dependson=c("mechanism","calibration-plot","trajectory","risk-profiles","frailty-nested","risk-set-schematic")}
+PFIG <- here("docs", "figures", "presentation")
+dir.create(PFIG, showWarnings = FALSE, recursive = TRUE)
 
-**3. I report on-court load, but it is interchangeable with minutes -
-and catching *why* mattered.** I use load because it is the better
-construct (what the body absorbed, not what the coach chose), and the
-whole model holds identically under a minutes robustness fit
-(concordance `r round(summary(m3)$concordance[1], 2)` either way,
-chronic HR \~`r round(summary(m3)$conf.int["z_ROLLING_LOAD_28D", 1], 1)`
-either way). An earlier version had load *out-predicting* minutes for
-soft-tissue injury (0.693 → 0.744); that was a tracking-data bug, DNP
-games leaking a fake zero distance, not a real edge. Distance is the
-right idea, but in NBA public data total load ≈ minutes (r ≈ 0.99) and
-the injurious high-speed component is unobserved, so the two are
-equivalent.
+pres_theme <- theme_minimal(base_size = 19) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(face = "bold", size = 21),
+        plot.subtitle = element_text(size = 15, colour = "grey30"),
+        axis.title = element_text(size = 16),
+        legend.position = "top", legend.title = element_blank(),
+        legend.text = element_text(size = 15))
 
-**4. The season's danger is in the baseline, not the coefficients.**
-Per-game baseline hazard is `r sprintf("%.1f", late_rate / early_rate)`
-x steeper late season, while covariate effects stay proportional
-throughout. Heavy chronic load is equally bad in October and April - the
-background risk is what rises.
+psave <- function(pl, name, w = 11, h = 6.2)
+  ggsave(file.path(PFIG, paste0(name, ".png")), pl, width = w, height = h,
+         dpi = 200, bg = "white")
 
-**5. Injury-proneness is real and largely unmeasured.** θ =
-`r round(theta, 3)` implies a
-`r round(exp(2 * qnorm(0.9) * sd_frail), 1)` x spread between the 90th
-and 10th percentile of proneness after adjusting for everything I have.
-Public data does not capture it.
+## P1 - the money figure, on the four-tier split. Chronic load is flat across the
+## tiers and largest in the CONTROL; acute load spikes where a pathology is actually
+## named and collapses everywhere else. That contrast IS the decomposition argument.
+## Point estimates are plotted, significance is marked, because the argument needs both.
+tier_lv <- c("Overuse\n(diagnosed)", "Overuse\n(symptom only)",
+             "Acute\nnon-contact", "Acute impact\n(CONTROL)")
+p1_mods <- list(m_rep_named, m_rep_vague, m_load, m_impact)
 
-## Limitations I want stated plainly
+pull_hr <- function(term) map_dbl(p1_mods, ~ hr(.x, term))
+pull_p  <- function(term) map_dbl(p1_mods, ~ summary(.x)$coefficients[term, "Pr(>|z|)"])
 
--   Health-gating is not fully solved. Point-in-time rest and
-    back-to-back covariates read protective because coaches rest at-risk
-    players. I mark them rather than interpret them, but I cannot remove
-    the bias with observational data.
--   The outcome is an availability signal, not a diagnosis. Injuries
-    come from official pre-game injury reports. I observe "listed Out
-    with a reason", not a clinician's diagnosis, and reason text is
-    inconsistent.
--   Concordance around 0.68 - 0.73 is a ceiling for public data. No GPS,
-    no medical screening, no detailed training load. I'd frame this as
-    establishing what public data *can* do rather than as a competitive
-    predictive model.
--   The lagged in-game load terms cost coverage. Requiring two prior
-    played games means a player's first two appearances each season
-    cannot be scored, so the primary model fits
-    `r format(m3$nevent, big.mark = ",")` new-injury events rather than
-    the full `r format(sum(cox$event), big.mark = ",")`. Early-season
-    injuries are the blind spot this introduces, a fair price for a
-    prospective, correctly-signed load term.
--   The sample includes end-of-rotation players whose availability is
-    driven by coaching and roster decisions rather than health. I keep
-    them because excluding players on *this* season's games played would
-    condition on the outcome, and I show in the rotation-player
-    sensitivity analysis that the workload effects hold without them, with
-    larger hazard ratios and lower discrimination. But their presence does add at-risk time that is
-    largely uninformative about injury.
--   Intensity is measured as a per-game distance-per-minute average, which
-    cannot resolve the high-speed and high-acceleration efforts that
-    sports science implicates in soft-tissue injury. Its null result is
-    evidence about *this* measure, not about intensity as a construct.
--   Mechanism tiers involve judgement. I assign categories by regex on
-    reason text. The three-tier split is defensible but not the only
-    defensible one.
--   Five seasons, one league. Two are COVID-affected. Season strata
-    handle the shape differences but cannot manufacture generalisability
-    beyond the NBA.
+neg <- tibble(
+  tier = factor(rep(tier_lv, 2), levels = tier_lv),
+  what = rep(c("Chronic load (28d)", "Acute load (7d)"), each = 4),
+  hr   = c(pull_hr("z_ROLLING_LOAD_28D"), pull_hr("z_ROLLING_LOAD_7D")),
+  p    = c(pull_p("z_ROLLING_LOAD_28D"),  pull_p("z_ROLLING_LOAD_7D"))) %>%
+  mutate(sig   = p < 0.05,
+         # label carries the estimate; "ns" flags the ones you cannot distinguish from 1
+         label = ifelse(sig, sprintf("%.2f", hr), sprintf("%.2f\nns", hr)))
 
-------------------------------------------------------------------------
+p_neg <- ggplot(neg, aes(tier, hr, colour = what, group = what)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey55", linewidth = .7) +
+  geom_line(linewidth = 1.6) +
+  # hollow points = not distinguishable from no effect, solid = significant
+  geom_point(aes(shape = sig, fill = what), size = 5.5, stroke = 1.6) +
+  geom_text(aes(label = label), vjust = -0.85, size = 5.2, fontface = "bold",
+            lineheight = .85, show.legend = FALSE) +
+  annotate("segment", x = 3.55, xend = 3.9, y = 2.42, yend = 2.42,
+           colour = "grey35", linewidth = .5) +
+  annotate("text", x = 3.72, y = 2.62, label = "load cannot cause these",
+           size = 4.6, colour = "grey25", fontface = "italic") +
+  scale_shape_manual(values = c(`TRUE` = 21, `FALSE` = 1), guide = "none") +
+  scale_colour_manual(values = c("Chronic load (28d)" = "#2166AC", "Acute load (7d)" = "#B2182B")) +
+  scale_fill_manual(values = c("Chronic load (28d)" = "#2166AC", "Acute load (7d)" = "#B2182B"),
+                    guide = "none") +
+  scale_y_continuous(limits = c(0.75, 2.85), breaks = c(1, 1.5, 2, 2.5)) +
+  labs(title = "Load cannot cause a jammed finger, but it predicts one",
+       subtitle = paste("Hazard ratio per SD; hollow points are not significant.",
+                        "Chronic load is largest in the control.",
+                        "Acute load only bites where a pathology is named."),
+       x = NULL, y = "Hazard ratio") +
+  pres_theme
+psave(p_neg, "P1_negative_control")
+
+## P2 - calibration, simplified
+p_cal <- ggplot(calib, aes(risk_group, event_rate_1k)) +
+  geom_col(fill = "#2166AC", width = .68) +
+  geom_text(aes(label = round(event_rate_1k)), vjust = -0.5, size = 5, fontface = "bold") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(expand = expansion(mult = c(0, .12))) +
+  labs(title = "Higher risk score, more injuries",
+       subtitle = "Observed injury rate by predicted-risk decile. Every step rises.",
+       x = "Risk decile (1 = lowest)", y = "Injuries per 1,000 games") +
+  pres_theme
+psave(p_cal, "P2_calibration")
+
+## P3 - baseline hazard, simplified
+p_traj <- ggplot(traj, aes(game_number, cum_haz)) +
+  geom_line(colour = "#B2182B", linewidth = 1.7) +
+  labs(title = "The season itself gets more dangerous",
+       subtitle = sprintf("Per-game baseline hazard is %.1fx steeper late season, for an average player",
+                          late_rate / early_rate),
+       x = "Game number", y = "Cumulative baseline hazard") +
+  pres_theme
+psave(p_traj, "P3_baseline_hazard")
+
+## P4 - frailty progression: the spread the covariates absorb
+fr <- tibble(step = factor(c("No covariates", "+ Workload", "+ Schedule", "+ Player context"),
+                           levels = c("No covariates", "+ Workload", "+ Schedule", "+ Player context")),
+             spread = exp(2 * qnorm(0.9) * sqrt(theta_steps)))
+p_fr <- ggplot(fr, aes(step, spread)) +
+  geom_col(fill = "#2166AC", width = .66) +
+  geom_text(aes(label = sprintf("%.1fx", spread)), vjust = -0.45, size = 6, fontface = "bold") +
+  scale_y_continuous(expand = expansion(mult = c(0, .15))) +
+  labs(title = "The model explains two thirds of what separates players",
+       subtitle = "Spread in injury proneness, 90th vs 10th percentile, as covariates are added",
+       x = NULL, y = "Hazard spread") +
+  pres_theme
+psave(p_fr, "P4_frailty_progression")
+
+## P5 - rolling profiles, larger type
+psave(fig_profiles + theme_minimal(base_size = 16) +
+        theme(strip.text = element_text(face = "bold", hjust = 0, size = 14),
+              plot.title = element_text(face = "bold", size = 20)),
+      "P5_rolling_profiles", w = 10.5, h = 7.4)
+
+## P6 - risk-set schematic, larger type
+psave(fig_riskset + theme(text = element_text(size = 15),
+                          legend.text = element_text(size = 12)),
+      "P6_risk_set", w = 12, h = 5.6)
+
+tibble(File = list.files(PFIG, pattern = "\\.png$")) %>%
+  show_tbl("Slide figures written")
+```
 
 # References {.unnumbered}
 
-*Compiled for review: verify each entry's details before the final
-reference list. Grouped by role, with a note on where each is used.*
+Compiled for review: verify each entry's details before the final
+reference list. Grouped by role, with a note on where each is used.
 
-**Statistical methodology**
+Statistical methodology
 
-1.  Therneau TM, Grambsch PM. *Modeling Survival Data: Extending the Cox
-    Model.* New York: Springer; 2000. The counting-process Cox
-    framework and time-varying covariates (whole pipeline).
+1.  Therneau TM, Grambsch PM. Modeling Survival Data: Extending the Cox
+    Model. New York: Springer; 2000. The counting-process Cox framework
+    and time-varying covariates (whole pipeline).
 2.  Andersen PK, Gill RD. Cox's regression model for counting processes:
-    a large sample study. *Annals of Statistics.* 1982;10(4):1100–1120. The Andersen–Gill recurrent-events model (Stage 4).
+    a large sample study. Annals of Statistics. 1982;10(4):1100–1120.
+    The Andersen–Gill recurrent-events model (Stage 4).
 3.  Prentice RL, Williams BJ, Peterson AV. On the regression analysis of
-    multivariate failure time data. *Biometrika.* 1981;68(2):373–379. The PWP gap-time model (Stage 4).
+    multivariate failure time data. Biometrika. 1981;68(2):373–379. The
+    PWP gap-time model (Stage 4).
 4.  Grambsch PM, Therneau TM. Proportional hazards tests and diagnostics
-    based on weighted residuals. *Biometrika.* 1994;81(3):515–526. The
+    based on weighted residuals. Biometrika. 1994;81(3):515–526. The
     scaled-Schoenfeld PH test behind `cox.zph` (Stage 2).
 5.  Harrell FE Jr, Califf RM, Pryor DB, Lee KL, Rosati RA. Evaluating
-    the yield of medical tests. *JAMA.* 1982;247(18):2543–2546. The
+    the yield of medical tests. JAMA. 1982;247(18):2543–2546. The
     concordance index (Harrell's C), used throughout for discrimination.
-6.  Efron B. The efficiency of Cox's likelihood function for censored
-    data. *Journal of the American Statistical Association.*
+6.  Lipsitch M, Tchetgen Tchetgen E, Cohen T. Negative controls: a tool
+    for detecting confounding and bias in observational studies.
+    Epidemiology. 2010;21(3):383-388. The framework for the Stage 5
+    mechanism split: the definition of a negative-control outcome, the
+    conditions under which one is informative, and the reading that a
+    control which fires has detected confounding rather than failed.
+7.  Efron B. The efficiency of Cox's likelihood function for censored
+    data. Journal of the American Statistical Association.
     1977;72(359):557–565. The Efron approximation for tied event times
     (`ties = "efron"`).
 
-**Applied / domain**
+Injury classification and outcome definition
 
-7.  Russell JL, McLean BD, Impellizzeri FM, Strack DS, Coutts AJ.
+8.  Bahr R, Clarsen B, Derman W, et al. International Olympic Committee
+    consensus statement: methods for recording and reporting of
+    epidemiological data on injury and illness in sport 2020 (including
+    the STROBE Extension for Sport Injury and Illness Surveillance,
+    STROBE-SIIS). British Journal of Sports Medicine.
+    2020;54(7):372-389. The framework for classifying injuries on
+    independent axes (body region, tissue type, mechanism, severity),
+    the acute / repetitive / mixed mechanism categories behind the Stage
+    5 tiers, and the time-loss severity bands.
+9.  Toohey LA, Drew MK, Fortington LV, Finch CF, Cook JL. An updated
+    subsequent injury categorisation model (SIC-2.0): data-driven
+    categorisation of subsequent injuries in sport. Sports Medicine.
+    2018;48(9):2199-2210. The data-driven categories used to classify
+    subsequent injuries on site, nature and side with no clinical input,
+    which is why this model rather than a recovery-based definition.
+10. Finch CF, Cook J. Categorising sports injuries in epidemiological
+    studies: the subsequent injury categorisation (SIC) model to address
+    multiple, recurrent and exacerbation of injuries. British Journal of
+    Sports Medicine. 2014;48(17):1276-1280. The original SIC model that
+    SIC-2.0 extends.
+11. Fuller CW, Ekstrand J, Junge A, et al. Consensus statement on injury
+    definitions and data collection procedures in studies of football
+    (soccer) injuries. Scandinavian Journal of Medicine & Science in
+    Sports. 2006;16(2):83-92. The basis for counting a same-site injury
+    after a return to play as a recurrent injury rather than a
+    continuation of the previous one, which is why my rule merges only
+    repeats arriving before a durable return.
+12. Heiderscheit BC, Sherry MA, Silder A, Chumanov ES, Thelen DG.
+    Hamstring strain injuries: recommendations for diagnosis,
+    rehabilitation, and injury prevention. Journal of Orthopaedic &
+    Sports Physical Therapy. 2010;40(2):67-81. Source of the roughly
+    two-week post-return window used to set the durability threshold:
+    about a third of hamstring injuries recur, with the greatest risk in
+    the initial two weeks after return to sport, attributed to
+    inadequate rehabilitation or a premature return.
+13. Eftekhari A, Cogan C, Pandya N, Feeley B. Hamstring injury
+    epidemiology in the National Basketball Association over a five-year
+    period. Muscles, Ligaments and Tendons Journal. 2022;12(2).
+    Basketball-specific evidence on repeat injury: 81.4% of NBA players
+    with a hamstring injury sustained a subsequent injury in the same
+    and/or following season, and those repeats are counted as subsequent
+    injuries rather than merged.
+14. Green B, Schache AG, Pizzari T. What is a recurrence? The onset,
+    frequency and time loss impact of recurrent calf muscle strain
+    injuries in elite male Australian football players over a decade.
+    BMJ Open Sport & Exercise Medicine. 2025;11(3):e002865. Applies the
+    IOC recurrence/exacerbation distinction to a decade of surveillance
+    data and documents how much subsequent-injury definitions vary
+    between studies.
+15. Orchard JW, Meeuwisse W, Derman W, et al. Sport Medicine Diagnostic
+    Coding System (SMDCS) and the Orchard Sports Injury and Illness
+    Classification System (OSIICS): revised 2020 consensus versions.
+    British Journal of Sports Medicine. 2020;54(7):397-401. The coding
+    systems that operationalise the IOC axes as body-part plus pathology
+    codes; my parsed site and tissue fields follow the same split.
+
+Applied / domain
+
+16. Russell JL, McLean BD, Impellizzeri FM, Strack DS, Coutts AJ.
     Measuring physical demands in basketball: an explorative systematic
-    review of practices. *Sports Medicine.* 2021;51(1):81–112. Justifies the on-court external-load (tracking-distance) exposure.
-    *(A review of load-monitoring methods; it does not support an
-    experience/tenure inverted-U, so it is no longer cited for the
-    `SEASONS_IN_LEAGUE²` term.)*
-8.  Chan C-C, Yung PS-H, Mok K-M. The relationship between training load
-    and injury risk in basketball: a systematic review. *Healthcare.*
-    2024;12(18):1829. The training-load–injury evidence base,
-    including U-shaped load–risk findings (motivates the load / ACWR
-    block).
-9.  Martin *[author initials / journal to verify]* et al. Rookie-season
+    review of practices. Sports Medicine. 2021;51(1):81–112. Justifies
+    the on-court external-load (tracking-distance) exposure. (A review
+    of load-monitoring methods; it does not support an experience/tenure
+    inverted-U, so it is no longer cited for the `SEASONS_IN_LEAGUE²`
+    term.)
+17. Chan C-C, Yung PS-H, Mok K-M. The relationship between training load
+    and injury risk in basketball: a systematic review. Healthcare.
+    2024;12(18):1829. The training-load–injury evidence base, including
+    U-shaped load–risk findings (motivates the load block).
+18. Martin [author initials / journal to verify] et al. Rookie-season
     injury and career longevity in NBA players. 2021. Durability /
     injury-proneness (frailty stage, and the durability side of the
     `SEASONS_IN_LEAGUE²` term).
-10. Hägglund M, Waldén M, Ekstrand J. Previous injury as a risk factor
+19. Hägglund M, Waldén M, Ekstrand J. Previous injury as a risk factor
     for injury in elite football: a prospective study over two
-    consecutive seasons. *British Journal of Sports Medicine.*
-    2006;40(9):767–772. Prior injury as a risk factor (the
-    prior-episode and recent-return covariates).
+    consecutive seasons. British Journal of Sports Medicine.
+    2006;40(9):767–772. Prior injury as a risk factor (the prior-episode
+    and recent-return covariates).
 
-**Tenure / age: the non-linear `SEASONS_IN_LEAGUE²` term**
+Tenure / age: the non-linear `SEASONS_IN_LEAGUE²` term
 
-11. National Basketball Association. *Player Participation Policy.*
+20. National Basketball Association. Player Participation Policy.
     Approved by the NBA Board of Governors, September 2023. The
     institutional mechanism: pre-approved back-to-back rest for players
     aged 35+, or with roughly 34,000 career regular-season minutes or
     1,000 career games, or a serious injury history. Younger players
-    receive no equivalent allowance, so acute load differs systematically
-    by tenure. *(Formalised from 2023-24; the same veteran-rest pattern
-    existed informally earlier in the study window. Note the CBA's "Years
-    of Service" provisions govern contracts and salary, not rest, so the
-    Participation Policy, not the CBA, is the correct citation here.)*
-12. Morikawa LH, Tummala SV, Brinkman JC, Buckner Petty SA, Chhabra A.
+    receive no equivalent allowance, so acute load differs
+    systematically by tenure. (Formalised from 2023-24; the same
+    veteran-rest pattern existed informally earlier in the study window.
+    Note the CBA's "Years of Service" provisions govern contracts and
+    salary, not rest, so the Participation Policy, not the CBA, is the
+    correct citation here.)
+21. Morikawa LH, Tummala SV, Brinkman JC, Buckner Petty SA, Chhabra A.
     Effect of a condensed NBA season on injury risk: an analysis of the
-    2020 season and player safety. *Orthopaedic Journal of Sports
-    Medicine.* 2022;10(9). Older players showed disproportionately
-    larger injury increases under schedule compression.
-13. Drakos MC, Domb B, Starkey C, Callahan L, Allen AA. Injury in the
-    National Basketball Association: a 17-year overview. *Sports Health.*
-    2010;2(4):284–290. Early NBA epidemiology found no clean *linear*
+    2020 season and player safety. Orthopaedic Journal of Sports
+    Medicine. 2022;10(9). Older players showed disproportionately larger
+    injury increases under schedule compression.
+22. Drakos MC, Domb B, Starkey C, Callahan L, Allen AA. Injury in the
+    National Basketball Association: a 17-year overview. Sports Health.
+    2010;2(4):284–290. Early NBA epidemiology found no clean linear
     age-injury association, supporting a non-linear specification.

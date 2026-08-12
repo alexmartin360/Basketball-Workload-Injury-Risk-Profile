@@ -25,6 +25,25 @@ SEASONS <- c("2021-22", "2022-23", "2023-24", "2024-25", "2025-26")
 
 BASE <- here::here("data", "processed")   # repo-root/data/processed, portable
 
+# Return-durability threshold: how many games a player must play after an injury
+# before a repeat at the SAME site counts as a new EPISODE rather than the old one
+# flaring up again. This replaced my old 90-day window.
+#
+# What I am counting is new episodes, and a genuine re-injury IS a new episode as
+# long as the player got back to playing properly first. So this is not "merge every
+# repeat" — it only merges the ones that arrive before the player has re-established
+# himself, which are the ones most likely to be the original problem never having
+# resolved. Anything after that is counted, which is also how the injury-epidemiology
+# consensus treats a recurrence (Fuller et al. 2006 count recurrences as injuries).
+#
+# Set to 8 games, roughly a fortnight of a team's schedule (teams play about 3.3
+# games a week here, and a fit player appears every other day). That is the window
+# Heiderscheit et al. (2010) identify as carrying the highest re-injury risk after
+# return to sport, which they attribute to incomplete rehabilitation or a premature
+# return — exactly the state I want to treat as a continuation rather than a fresh
+# injury. Sensitivity-tested across the full range in the report.
+RETURN_DURABILITY_GAMES <- 8
+
 # Dictionary functions (injury_body_region etc.) + make this script self-contained
 source(here::here("analysis", "1. Injury Classification Rules.R"))
 
@@ -102,7 +121,7 @@ stints0 <- gl_reg %>%
   ) %>%
   arrange(SEASON, PLAYER_ID, first_played) %>%
   group_by(SEASON, PLAYER_ID) %>%
-  mutate(stint_rank = row_number(), n_stints = n(), next_first = lead(first_played)) %>%
+  mutate(stint_rank = row_number(), n_stints = n(), next_first = dplyr::lead(first_played)) %>%
   ungroup()
 
 # Now I attribute each injury Out date to the stint whose [lo, hi) interval contains
@@ -132,8 +151,7 @@ stints <- stints0 %>%
     win_end   = pmax(last_played,  coalesce(inj_hi, last_played))
   )
 
-# Here's the skeleton itself: I cross each stint with its team's regular-season
-# games that fall inside the tenure window, then left-join the player's box score.
+# I cross each stint with its team's regular-season games that fall inside the tenure window, then left-join the player's box score.
 # If the box score is there they played; if it's missing (NA minutes) they missed.
 panel <- stints %>%
   select(SEASON, PLAYER_ID, PLAYER_NAME, TEAM_ID, TEAM_ABBREVIATION, win_start, win_end) %>%
@@ -154,10 +172,6 @@ panel <- stints %>%
     by = c("SEASON", "PLAYER_ID", "GAME_ID", "TEAM_ID")
   ) %>%
   mutate(PLAYED_FLAG = as.integer(!is.na(MIN))) %>%
-  # The one rule my whole counting-process setup depends on: exactly one row per
-  # player per calendar date. A few overlaps sneak in when a player is waived and
-  # re-signed by the same team (their stint windows touch), so where there's a tie
-  # I keep the played row.
   arrange(SEASON, PLAYER_ID, GAME_DATE, desc(PLAYED_FLAG)) %>%
   distinct(SEASON, PLAYER_ID, GAME_DATE, .keep_all = TRUE)
 
@@ -179,10 +193,10 @@ appeared <- panel %>%
   arrange(PLAYER_ID, GAME_DATE) %>%
   group_by(SEASON, PLAYER_ID) %>%
   mutate(
-    PLAYER_DAYS_SINCE_LAST_PLAYED = as.numeric(GAME_DATE - lag(GAME_DATE)) - 1,
+    PLAYER_DAYS_SINCE_LAST_PLAYED = as.numeric(GAME_DATE - dplyr::lag(GAME_DATE)) - 1,
     IS_B2B     = as.integer(PLAYER_DAYS_SINCE_LAST_PLAYED == 0),
     IS_B2B_2ND = IS_B2B,
-    IS_B2B_1ST = as.integer(lead(IS_B2B, default = 0L) == 1 & IS_B2B == 0),
+    IS_B2B_1ST = as.integer(dplyr::lead(IS_B2B, default = 0L) == 1 & IS_B2B == 0),
     SEASON_B2B_COUNT       = cumsum(replace_na(IS_B2B, 0)),
     GAMES_PLAYED = row_number(),
     IS_3IN4 = as.integer(slide_index_dbl(rep(1, n()), GAME_DATE, sum,
@@ -202,16 +216,7 @@ appeared <- panel %>%
     
     SEASON_CUMULATIVE_MIN  = cumsum(MIN),
     
-    # Rolling FREQUENCY / CONGESTION dose — I count the qualifying games in each
-    # trailing window the same way I do the rolling minutes (sum over
-    # .before = days(N), including the current game). I like these accumulated-dose
-    # measures because they're the recency-weighted version of the point-in-time
-    # IS_B2B flag and the season-long SEASON_B2B_COUNT — but unlike the point-in-time
-    # flags they can't be fooled by a coach resting a player on a given night. They
-    # tell me how much congestion the body has actually soaked up lately, which I
-    # think is the cleaner exposure. (I did consider a rolling 3-in-4 dose but left
-    # it out — it's just a coarse threshold restatement of short-term minutes
-    # density that ROLLING_MIN_7D/28D already capture continuously.)
+    # Rolling FREQUENCY / CONGESTION dose
     ROLLING_GAMES_7D  = slide_index_dbl(rep(1, n()), GAME_DATE, sum,
                                         .before = days(7),  .complete = FALSE),
     ROLLING_GAMES_28D = slide_index_dbl(rep(1, n()), GAME_DATE, sum,
@@ -277,8 +282,8 @@ appearance_coords <- appeared %>%
   arrange(SEASON, PLAYER_ID, GAME_DATE) %>%
   group_by(SEASON, PLAYER_ID) %>%
   mutate(
-    PREV_LAT = lag(ARENA_LAT),
-    PREV_LON = lag(ARENA_LON),
+    PREV_LAT = dplyr::lag(ARENA_LAT),
+    PREV_LON = dplyr::lag(ARENA_LON),
     PLAYER_TRAVEL_KM = case_when(
       is.na(PREV_LAT) | is.na(ARENA_LAT) ~ NA_real_,
       ARENA_LAT == PREV_LAT & ARENA_LON == PREV_LON ~ 0,
@@ -322,26 +327,13 @@ panel <- panel %>%
     by = c("PLAYER_ID", "GAME_ID")
   )
 
-# ── 3d.1 Tracking metrics are only real on games the player PLAYED ──
-# I found a nasty bug here. clean_game_load carries DNP rows with 0s — a player who
-# shows up in the tracking box score but didn't really play — and left-joining those
-# onto a missed game attaches DISTANCE = 0 (not NA). Downstream in file 5 the carry-
-# forward (LOCF) then PROPAGATES that 0 forward instead of the last real played value,
-# so injured players' rows end up with a fake ~0 distance. MIN dodges this because it's
-# always NA (never 0) on a missed game, so its carry-forward is clean. The fix: blank
-# the in-game tracking metrics on non-played rows so they're NA like MIN, and the
-# carry-forward uses the last game the player actually played.
+# ── 3d.1 Tracking metrics are only real on games the player PLAYED
 tracking_cols <- c("DISTANCE", "SPEED", "TOUCHES", "USAGEPERCENTAGE", "POSSESSIONS", "PACE")
 panel <- panel %>%
   mutate(across(any_of(tracking_cols),
                 ~ if_else(PLAYED_FLAG == 1, as.numeric(.x), NA_real_)))
 
-# ── 3d.2 Rolling ON-COURT physical load (external load) ── built from tracking DISTANCE
-# My reasoning: minutes played is really a COACHING decision, so it's selection-biased.
-# The DISTANCE a player covers on court is closer to what their body actually absorbed
-# — what sports science calls "external load". So I roll distance into the same acute
-# (7d) and chronic (28d) windows I use for minutes, and build a tracking-based ACWR
-# (acute:chronic ratio), which is the version of ACWR the literature actually intends.
+# ── 3d.2 Rolling ON-COURT physical load (external load) 
 tracking_load <- panel %>%
   filter(PLAYED_FLAG == 1) %>%                                  # load only exists on games he played
   arrange(SEASON, PLAYER_ID, GAME_DATE) %>%                     # chronological, per player
@@ -367,21 +359,7 @@ tracking_load <- panel %>%
 panel <- panel %>%                                              # attach the rolling-load features back
   left_join(tracking_load, by = c("SEASON", "PLAYER_ID", "GAME_ID"))
 
-# ── 3d.3 On-court INTENSITY (load per minute) ── the part of load that ISN'T volume.
-# I found that rolling DISTANCE and rolling MINUTES are ~0.99 collinear — a player's
-# distance is basically their minutes times a fairly steady rate — so rolling distance
-# on its own can't tell me anything minutes don't. What actually SEPARATES them is
-# intensity: distance covered PER minute, i.e. how hard they moved rather than how long.
-# I build it per game (DISTANCE / MIN) and as a trailing-window average (total distance
-# / total minutes over the window). The window version is decorrelated from minutes
-# (~ -0.27), so it lets me carry a genuine on-court-load signal alongside minutes as the
-# volume control, instead of a distance term that's just minutes in disguise.
-# I only trust the rolling ratio once there's a real base of minutes in the window
-# (>=30 in 7d, >=60 in 28d); below that the ratio is dividing tiny numbers and is noise.
-# Same logic per game: a 2-minute garbage-time cameo divides distance by a tiny number
-# and returns a wild rate that isn't a meaningful "how hard he worked" measure. About
-# 16% of played games are under 10 minutes, so I require MIN >= 10 for a per-game
-# intensity value; below that it's left NA rather than allowed to inject noise.
+# ── 3d.3 On-court INTENSITY (load per minute) 
 MIN_INTENSITY_MINUTES <- 10
 panel <- panel %>%
   mutate(
@@ -409,10 +387,7 @@ panel <- panel %>%
   mutate(
     PRESEASON_GP       = replace_na(PRESEASON_GP, 0L),
     # My proxy for "did this player have a normal training camp?" is simply whether
-    # they played in ANY pre-season game. The raw count is too noisy to trust
-    # (coaches rest their starters and run deep benches), so the yes/no flag —
-    # showed up vs late signing / camp absentee — is the cleaner signal. I keep the
-    # PRESEASON_GP count around for EDA.
+    # they played in ANY pre-season game. 
     PLAYED_PRESEASON   = as.integer(PRESEASON_GP > 0),
     PLAYER_AGE_AT_GAME = round(as.numeric(GAME_DATE - BIRTHDATE) / 365.25, 2)
   ) %>%
@@ -422,10 +397,7 @@ panel <- panel %>%
 # body region.
 # I join on my NORMALISED name key rather than the raw name, because otherwise the
 # spelling drift between the injury reports and the game logs (Jokic vs Jokić, Butler
-# vs Butler III) silently drops real injuries — which was the whole point of the
-# audit. I also dedupe the injury side on that key first, to cover the rare case
-# where two different players collapse to the same key on one date (I keep the
-# genuine Out).
+# vs Butler III) silently drops injuries 
 injuries_join <- clean_injuries %>%
   mutate(join_key = norm_name(PLAYER_NAME_NORM)) %>%
   arrange(SEASON, game_date, join_key, desc(IS_OUT), desc(IS_INJURY_ABSENCE)) %>%
@@ -448,11 +420,24 @@ panel <- panel %>%
       PLAYED_FLAG == 1 ~ 0,
       TRUE ~ 0
     ),
-    # Body region (from my rulebook) so I can spot reaggravations of the same part.
+    # ── IOC axes (Bahr et al. BJSM 2020) parsed from the raw report text ──
+    # The reports read "Injury/Illness - <SITE>; <PATHOLOGY>", so site, tissue and
+    # side are all recoverable. I classify each axis independently instead of
+    # collapsing them into one list of categories.
+    INJURY_REGION    = injury_region_ioc(INJURY_REASON),   # IOC body region
+    INJURY_SIDE      = injury_side(INJURY_REASON),         # left/right/bilateral
+    INJURY_TISSUE    = injury_tissue_ioc(INJURY_REASON),   # IOC tissue type
+    INJURY_MECH_RAW  = injury_mechanism_ioc(INJURY_REASON),# repetitive/acute_*/unclassified
+    # The "site" I match recurrences on is region + side together. A left hamstring
+    # strain after a right hamstring strain is a different injury, not the same one
+    # coming back, and SIC-2.0 treats side as part of the relationship.
+    INJURY_SITE_KEY  = if_else(
+      INJURY_REGION == "unspecified", NA_character_,
+      paste(INJURY_REGION, if_else(INJURY_SIDE == "unspecified", "na", INJURY_SIDE), sep = "_")
+    ),
+    # Kept so older code and the earlier write-up still run.
     INJURY_BODY_REGION = injury_body_region(INJURY_CATEGORY),
-    # Mechanism tier for my negative-control outcome: soft_tissue (overuse, load
-    # SHOULD drive) vs traumatic_load vs random_impact (contact, the clean control).
-    INJURY_MECHANISM = injury_mechanism(INJURY_CATEGORY)
+    INJURY_MECHANISM   = injury_mechanism(INJURY_CATEGORY)
   ) %>%
   select(-join_key, -IS_OUT, -IS_INJURY_ABSENCE)
 
@@ -468,8 +453,12 @@ panel <- panel %>%
   arrange(SEASON, PLAYER_ID, GAME_DATE) %>%
   group_by(SEASON, PLAYER_ID) %>%
   mutate(
-    prev_played      = lag(PLAYED_FLAG, default = 1L),
-    prev_body_region = lag(INJURY_BODY_REGION, default = NA_character_),
+    prev_played      = dplyr::lag(PLAYED_FLAG, default = 1L),
+    prev_body_region = dplyr::lag(INJURY_SITE_KEY, default = NA_character_),
+    # Running count of games actually PLAYED. The return-durability rule below is
+    # measured in games rather than days, because a player can be "off the injury
+    # report" without having played, and games are what my clock counts anyway.
+    gp_running = cumsum(PLAYED_FLAG),
     
     # I say a new spell starts either on the first missed game after a played one,
     # OR when the body region changes mid-absence (e.g. it flips back -> foot without
@@ -477,11 +466,9 @@ panel <- panel %>%
     region_changed = as.integer(
       INJURY_TIMELOSS == 1 &
         prev_played == 0 &
-        !is.na(INJURY_BODY_REGION) &
+        !is.na(INJURY_SITE_KEY) &
         !is.na(prev_body_region) &
-        INJURY_BODY_REGION != "unspecified" &
-        prev_body_region  != "unspecified" &
-        INJURY_BODY_REGION != prev_body_region
+        INJURY_SITE_KEY != prev_body_region
     ),
     
     spell_start = as.integer(
@@ -505,15 +492,21 @@ panel <- panel %>%
       na.rm = FALSE
     ),
     
-    # Region at each spell start, carried forward across the episode
+    # Site key at each spell start, carried forward across the episode
     episode_region = zoo::na.locf(
-      if_else(spell_start == 1, INJURY_BODY_REGION, NA_character_),
+      if_else(spell_start == 1, INJURY_SITE_KEY, NA_character_),
       na.rm = FALSE
     ),
+    # Tissue and mechanism, carried forward from the FIRST report of the episode.
+    episode_tissue = zoo::na.locf(
+      if_else(spell_start == 1, INJURY_TISSUE, NA_character_), na.rm = FALSE),
+    episode_mech = zoo::na.locf(
+      if_else(spell_start == 1 & INJURY_MECH_RAW != "unclassified",
+              INJURY_MECH_RAW, NA_character_), na.rm = FALSE),
     
     DAYS_SINCE_LAST_RETURN = if_else(
       INJURY_TIMELOSS == 1 & spell_start == 1,
-      as.numeric(GAME_DATE - lag(last_played_date, default = NA_Date_)),
+      as.numeric(GAME_DATE - dplyr::lag(last_played_date, default = NA_Date_)),
       NA_real_
     ),
     
@@ -521,7 +514,7 @@ panel <- panel %>%
     # after a timeloss spell) carried backward to fill the episode it belongs to.
     ep_region    = if_else(spell_start == 1 & !is.na(episode_region), episode_region, NA_character_),
     ep_return_raw = if_else(
-      PLAYED_FLAG == 1 & lag(INJURY_TIMELOSS, default = 0L) == 1,
+      PLAYED_FLAG == 1 & dplyr::lag(INJURY_TIMELOSS, default = 0L) == 1,
       GAME_DATE,
       NA_Date_
     ),
@@ -536,44 +529,84 @@ panel <- panel %>%
       cur_reg <- episode_region
       n       <- n()
       result  <- rep(NA_real_, n)
-      
+
       for (i in seq_len(n)) {
-        if (!isTRUE(spell_start[i] == 1) || is.na(cur_reg[i]) ||
-            cur_reg[i] == "unspecified") next
-        
+        if (!isTRUE(spell_start[i] == 1) || is.na(cur_reg[i])) next
+
         prior_same <- which(
           seq_len(n) < i &
             !is.na(regions) &
             regions == cur_reg[i]
         )
         if (length(prior_same) == 0) next
-        
+
         prior_same_with_date <- prior_same[!is.na(returns[prior_same])]
         if (length(prior_same_with_date) == 0) next
-        
+
         most_recent_idx <- prior_same_with_date[
           which.max(returns[prior_same_with_date])
         ]
         result[i] <- as.numeric(GAME_DATE[i] - returns[most_recent_idx])
       }
       result
+    },
+
+    # GAMES PLAYED since the previous episode at the SAME site (region + side).
+    GAMES_SINCE_LAST_SAME_SITE = {
+      regions <- ep_region
+      cur_reg <- episode_region
+      gp      <- gp_running
+      n       <- n()
+      result  <- rep(NA_real_, n)
+
+      for (i in seq_len(n)) {
+        if (!isTRUE(spell_start[i] == 1) || is.na(cur_reg[i])) next
+        prior_same <- which(seq_len(n) < i & !is.na(regions) & regions == cur_reg[i])
+        if (length(prior_same) == 0) next
+        result[i] <- gp[i] - gp[max(prior_same)]
+      }
+      result
+    },
+
+    # SIC-2.0 data-driven categorisation (Toohey et al. Sports Med 2018;48:2199-2210).
+    # Each episode is described by its relationship to the PREVIOUS episode on the two
+    # things I can observe without a clinician: site (region + side) and nature
+    # (tissue type). The clinical "related / unrelated" sub-tier of SIC-2.0 needs
+    # medical records, so I leave it unpopulated rather than guess at it.
+    SIC_CATEGORY = {
+      site   <- episode_region
+      tiss   <- episode_tissue
+      starts <- which(spell_start == 1 & INJURY_TIMELOSS == 1)
+      n      <- n()
+      result <- rep(NA_character_, n)
+
+      for (k in seq_along(starts)) {
+        i <- starts[k]
+        if (k == 1) { result[i] <- "I index injury"; next }
+        j <- starts[k - 1]                      # the immediately preceding episode
+        same_site   <- !is.na(site[i]) && !is.na(site[j]) && site[i] == site[j]
+        same_tissue <- !is.na(tiss[i]) && !is.na(tiss[j]) && tiss[i] == tiss[j]
+        result[i] <- case_when(
+          same_site  &  same_tissue ~ "II same site, same nature",
+          same_site  & !same_tissue ~ "VI same site, different nature",
+          !same_site &  same_tissue ~ "VII different site, same nature",
+          TRUE                      ~ "VIII different site, different nature"
+        )
+      }
+      result
     }
   ) %>%
   mutate(
-    # I flag a reaggravation when it's the same region within 90 days (using that
-    # look-back scan), or when it's an unspecified absence within 90 days — I treat
-    # the unspecified case as a reaggravation too, to be conservative about not
-    # over-counting brand-new injuries.
+    # A repeat at the same site (region + side) counts as a reaggravation if the
+    # player played fewer than RETURN_DURABILITY_GAMES games in between. The
+    # threshold is arbitrary, so it is sensitivity-tested in the report.
+    # It matters: 22% of same-site repeats occur after a single game back, which is
+    # exactly the "returned but not recovered" case.
     IS_REAGGRAVATION = as.integer(
       spell_start == 1 &
         INJURY_TIMELOSS == 1 &
-        (
-          (!is.na(DAYS_SINCE_LAST_SAME_REGION_RETURN) &
-             DAYS_SINCE_LAST_SAME_REGION_RETURN <= 90) |
-            (coalesce(episode_region, "") == "unspecified" &
-               !is.na(DAYS_SINCE_LAST_RETURN) &
-               DAYS_SINCE_LAST_RETURN <= 90)
-        )
+        !is.na(GAMES_SINCE_LAST_SAME_SITE) &
+        GAMES_SINCE_LAST_SAME_SITE < RETURN_DURABILITY_GAMES
     ),
     
     IS_NEW_INJURY = as.integer(
@@ -587,9 +620,18 @@ panel <- panel %>%
     TIMELOSS_CUMSUM   = cumsum(INJURY_TIMELOSS)
   ) %>%
   # Drop episode-construction working columns
+  mutate(
+    # Promote the episode-level classifications onto every row of the episode, so the
+    # survival build can read a tissue / mechanism for the whole spell rather than
+    # only for the day the diagnosis happened to be written down.
+    INJURY_MECHANISM_IOC = coalesce(episode_mech, "unclassified"),
+    INJURY_TISSUE_EP     = episode_tissue,
+    INJURY_SITE_EP       = episode_region
+  ) %>%
   select(
     -prev_played, -prev_body_region, -region_changed, -spell_start,
-    -last_played_date, -episode_region, -ep_region, -ep_return, -ep_return_raw
+    -last_played_date, -episode_region, -ep_region, -ep_return, -ep_return_raw,
+    -gp_running, -episode_tissue, -episode_mech
   ) %>%
   ungroup()
 
@@ -606,24 +648,15 @@ message("    Reaggravation events:       ",
 
 # ── 3h. Cumulative games missed (within season) ── a time-varying fragility signal.
 # This is a running count of how many games the player has missed SO FAR this season
-# as they walk into each game. I have to build it HERE, on the full panel while every
-# scheduled game is still a row — file 5 drops the injured-absence rows for the risk
-# set, so if I waited it'd be too late. The lag() makes it "games missed BEFORE this
-# game", which keeps it exogenous to whatever happens in the current row.
 panel <- panel %>%
   arrange(SEASON, PLAYER_ID, GAME_DATE) %>%
   group_by(SEASON, PLAYER_ID) %>%
   mutate(
-    SEASON_GAMES_MISSED = lag(cumsum(PLAYED_FLAG == 0), default = 0L)
+    SEASON_GAMES_MISSED = dplyr::lag(cumsum(PLAYED_FLAG == 0), default = 0L)
   ) %>%
   ungroup()
 
-# ── 3h.2 Prior-injury history (within-season, time-varying) ── the recurrent burden.
-# These are the covariates I added to close the "prior injury isn't in the model"
-# gap. For each game I encode what the player's injury history ALREADY is as they
-# enter it. Like SEASON_GAMES_MISSED above, they're all lagged / past-only and built
-# on the full panel (injured rows still present), so they stay exogenous to the
-# current row's event.
+# ── 3h.2 Prior-injury history (within-season, time-varying)
 #   PRIOR_EPISODES_SEASON  how many injury episodes (new + reaggravation) they've had
 #                          this season already (recurrent burden; Martin 2021)
 #   EVER_INJURED_SEASON    have they had at least one episode this season yet
@@ -637,7 +670,7 @@ panel <- panel %>%
   group_by(SEASON, PLAYER_ID) %>%
   mutate(
     # Episodes entering this game = lag of the running episode count (new + reaggr).
-    PRIOR_EPISODES_SEASON = lag(
+    PRIOR_EPISODES_SEASON = dplyr::lag(
       cumsum(replace_na(IS_NEW_INJURY, 0L) + replace_na(IS_REAGGRAVATION, 0L)),
       default = 0L
     ),
@@ -645,7 +678,7 @@ panel <- panel %>%
     # Date of the most recent return-to-play after an injury absence, carried
     # forward. A return game is a played game whose previous row was timeloss.
     .return_date = if_else(
-      PLAYED_FLAG == 1 & lag(INJURY_TIMELOSS, default = 0L) == 1,
+      PLAYED_FLAG == 1 & dplyr::lag(INJURY_TIMELOSS, default = 0L) == 1,
       GAME_DATE, NA_Date_
     ),
     .last_return = zoo::na.locf(.return_date, na.rm = FALSE),
@@ -711,6 +744,10 @@ panel <- panel %>%
     # Outcome
     PLAYED_FLAG, INJURY_FLAG, INJURY_CATEGORY, INJURY_REASON, INJURY_BODY_REGION,
     INJURY_MECHANISM,
+    # IOC axes (region / tissue / mechanism / side) + SIC-2.0 subsequent-injury code
+    INJURY_REGION, INJURY_SIDE, INJURY_TISSUE, INJURY_SITE_KEY,
+    INJURY_MECHANISM_IOC, INJURY_TISSUE_EP, INJURY_SITE_EP, SIC_CATEGORY,
+    GAMES_SINCE_LAST_SAME_SITE,
     INJURY_TIMELOSS, INJURY_EPISODE_ID, TIMELOSS_GAMES,
     IS_NEW_INJURY, IS_REAGGRAVATION, IS_QUESTIONABLE, IS_PROBABLE, IS_STRUCTURAL,
     # Time axis
@@ -757,9 +794,7 @@ saveRDS(panel, file.path(BASE, "panel_2021-26.rds"))
 message("\n=== Panel complete === rows: ", nrow(panel), " | cols: ", ncol(panel),
         " | players: ", n_distinct(panel$PLAYER_ID))
 
-# =============================================================================
 # 4. AUDIT — do my injury reports actually land on a panel row?
-# =============================================================================
 # My panel is only as good as its OUTCOME, so I check the outcome before I trust
 # anything built on it. Every injury gets in through a name-based join (the report
 # gives me a NAME, the game logs give me a PLAYER_ID), which means a silent name

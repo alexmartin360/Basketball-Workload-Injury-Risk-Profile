@@ -1,0 +1,4 @@
+"Check","Value"
+"VIF of lag-2 against the rolling-load block",3.11
+"Out-of-sample C, lag-2 in the model",0.713
+"Out-of-sample C, lag-2 dropped",0.7053
