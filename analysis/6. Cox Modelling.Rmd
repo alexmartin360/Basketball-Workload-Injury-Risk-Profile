@@ -51,8 +51,7 @@ library(here)      # portable paths anchored at the repo root (.Rproj / .git)
 
 BASE <- here("data", "processed")   # repo-root/data/processed, wherever the repo lives
 
-# The injury rulebook, so the classification helpers (injury_severity_ioc etc.) are
-# the exact same ones the data was built with rather than a second copy.
+# The injury rulebook, the classification helpers (injury_severity_ioc etc.) 
 source(here("analysis", "1. Injury Classification Rules.R"))
 
 # Must match the value used when the panel was built in file 4.
@@ -423,7 +422,7 @@ Three specification choices carry the design, and each is a deliberate
 answer to a feature of this data:
 
 | Choice | Why it is there |
-|----|----|
+|------------------------------------|------------------------------------|
 | `Surv(t_start, t_stop, event)` | Counting-process form, so covariates can change every game. injured this season y/n model would collapse the season to one outcome and be blind to when risk moves. |
 | `strata(SEASON)` | Each season gets its own baseline hazard. The COVID-adjacent seasons had a genuinely different shape, and I don't want that contaminating the covariate effects. I assume workload acts the same way each season, not that each season is equally dangerous. |
 | `cluster(PLAYER_ID)` | LeBron contributes \~332 rows that are one repeatedly-observed person, not 332 independent facts. Without this the standard errors are far too narrow. |
@@ -434,43 +433,27 @@ say chronic load matters more than travel, otherwise I'd be comparing an
 effect measured in minutes against one measured in kilometres.
 
 ```{r zscore}
-z <- function(x) as.numeric(scale(x))
+z_cols <- c(
+  # Workload - minutes, on-court load, intensity
+  "ROLLING_MIN_7D", "ROLLING_MIN_28D", "ACWR_MIN", "ROLLING_GAMES_7D", "MIN",
+  "PREV_GAME_MIN", "PREV_2GAME_MIN", "PREV_GAME_INTENSITY", "PREV_2GAME_INTENSITY",
+  "ROLLING_LOAD_7D", "ROLLING_LOAD_28D", "ACWR_LOAD",
+  "PREV_GAME_DISTANCE", "PREV_2GAME_DISTANCE",
+  # Travel
+  "ROLLING_DIST_7D", "ROLLING_DIST_28D", "SEASON_CUMULATIVE_DIST",
+  # Schedule congestion
+  "IS_B2B", "ROLLING_B2B_7D", "ROLLING_B2B_28D", "PLAYER_ROAD_TRIP_GAME_NUMBER",
+  "TEAM_DAYS_REST",
+  # Player context
+  "SEASONS_IN_LEAGUE", "CAREER_GAMES_MISSED", "PRIOR_EPISODES_SEASON",
+  "PCT_THROUGH_SEASON", "HEIGHT_INCHES", "WEIGHT"
+)
 
-cox <- cox %>%
-  mutate(
-    # Workload - minutes & intensity -based
-    z_ROLLING_MIN_7D   = z(ROLLING_MIN_7D),
-    z_ROLLING_MIN_28D  = z(ROLLING_MIN_28D),
-    z_ACWR_MIN         = z(ACWR_MIN),
-    z_ROLLING_GAMES_7D = z(ROLLING_GAMES_7D),
-    z_MIN              = z(MIN),
-    z_PREV_GAME_MIN    = z(PREV_GAME_MIN),   
-    z_PREV_2GAME_MIN   = z(PREV_2GAME_MIN), 
-    z_PREV_GAME_INTENSITY    = z(PREV_GAME_INTENSITY),
-    z_PREV_2GAME_INTENSITY   = z(PREV_2GAME_INTENSITY),
-    z_ROLLING_LOAD_7D  = z(ROLLING_LOAD_7D),
-    z_ROLLING_LOAD_28D = z(ROLLING_LOAD_28D),
-    z_ACWR_LOAD        = z(ACWR_LOAD),
-    z_PREV_GAME_DISTANCE   = z(PREV_GAME_DISTANCE),
-    z_PREV_2GAME_DISTANCE  = z(PREV_2GAME_DISTANCE),
-    # Travel
-    z_ROLLING_DIST_7D        = z(ROLLING_DIST_7D),
-    z_ROLLING_DIST_28D       = z(ROLLING_DIST_28D),
-    z_SEASON_CUMULATIVE_DIST = z(SEASON_CUMULATIVE_DIST),
-    # Schedule congestion
-    z_IS_B2B = z(IS_B2B),
-    z_ROLLING_B2B_7D               = z(ROLLING_B2B_7D),
-    z_ROLLING_B2B_28D              = z(ROLLING_B2B_28D),
-    z_PLAYER_ROAD_TRIP_GAME_NUMBER = z(PLAYER_ROAD_TRIP_GAME_NUMBER),
-    z_TEAM_DAYS_REST               = z(TEAM_DAYS_REST),
-    # Player context
-    z_SEASONS_IN_LEAGUE     = z(SEASONS_IN_LEAGUE),
-    z_CAREER_GAMES_MISSED   = z(CAREER_GAMES_MISSED),
-    z_PRIOR_EPISODES_SEASON = z(PRIOR_EPISODES_SEASON),
-    z_PCT_THROUGH_SEASON    = z(PCT_THROUGH_SEASON),
-    z_HEIGHT_INCHES         = z(HEIGHT_INCHES),
-    z_WEIGHT                = z(WEIGHT)
-  )
+cox <- cox %>% mutate(across(all_of(z_cols), ~ as.numeric(scale(.x)), .names = "z_{.col}"))
+
+# Days rest is modelled standardised, so its SD converts the per-SD hazard ratio back
+# into the per-extra-rest-day figure the prose compares against Lewis (2018).
+sd_rest <- sd(cox$TEAM_DAYS_REST, na.rm = TRUE)
 
 # Two collinearity figures the prose quotes, computed here so they cannot go stale.
 r_load_min <- cor(cox$ROLLING_LOAD_28D, cox$ROLLING_MIN_28D, use = "pairwise.complete.obs")
@@ -682,11 +665,12 @@ Team days rest is the opposite case. Protective at HR
 `r hr(m3, "z_TEAM_DAYS_REST")`, which is what physiology predicts rather
 than a puzzle, and it is the one schedule covariate that cannot be
 health-gated: it comes off the fixture list and every team-mate shares
-it on a given date. Its SD is about a day, so that is roughly 13% lower
-hazard per extra rest day, against Lewis (2018) reporting 15.96% lower
-odds on different seasons with a different model. On the one covariate
-where selection is ruled out by construction, an independent estimate
-comes back almost exactly. No asterisk.
+it on a given date. Its SD is `r round(sd_rest, 2)` days, so that is
+`r round(100 * (1 - exp(unname(coef(m3)["z_TEAM_DAYS_REST"]) / sd_rest)), 1)`%
+lower hazard per extra rest day, against Lewis (2018) reporting 15.96%
+lower odds on different seasons with a different model. On the one
+covariate where selection is ruled out by construction, an independent
+estimate comes back almost exactly. No asterisk.
 
 `RECENT_RETURN` is the clearest case of the same thing. A player in the
 fortnight after returning carries HR `r hr(m3, "RECENT_RETURN")`, lower
@@ -1662,13 +1646,25 @@ rho_events <- cor(player_lvl$mean_lp, player_lvl$events, method = "spearman")
 show_tbl(quint_tab, paste0("Player-level risk score against injury count, ", TEST,
                            " (Spearman rho = ", round(rho_events, 2), ")"))
 
-# Three exemplars: two the model ranks correctly, one it does not. Chosen on injury
-# EVENTS, not games missed - see the note below on why games missed is the wrong target.
+# Three exemplars spanning the risk range. Chosen on injury EVENTS, not games missed -
+# see the note below on why games missed is the wrong target.
+# The episode counts are read off the data rather than typed in: they were hard-coded
+# once and went stale the moment the outcome definition changed, so the figure claimed
+# five episodes for Johnson while the tables said seven.
+pick_names <- c("Jalen Johnson", "LeBron James", "Jamal Shead")
+pick_n <- season %>% filter(PLAYER_NAME %in% pick_names) %>%
+  group_by(PLAYER_NAME) %>% summarise(n_ev = sum(event), .groups = "drop")
 picks <- tibble(
-  PLAYER_NAME = c("Jalen Johnson", "LeBron James", "Jamal Shead"),
-  role = c("High risk, five injury episodes - ranked correctly",
-           "Average risk, three injury episodes - the model's miss",
-           "Low risk, no injury episodes - ranked correctly"))
+  PLAYER_NAME = pick_names,
+  band_label  = c("Highest risk", "Upper-middle risk", "Lowest risk")) %>%
+  left_join(pick_n, by = "PLAYER_NAME") %>%
+  mutate(role = paste0(
+    band_label, ", ",
+    if_else(n_ev == 0, "no injury episodes",
+            paste0(n_ev, " injury episode", if_else(n_ev == 1, "", "s"))),
+    if_else(PLAYER_NAME == "Jamal Shead",
+            " - and still close to the median",
+            " - ranked correctly")))
 
 ex <- season %>% inner_join(picks, by = "PLAYER_NAME") %>%
   arrange(PLAYER_NAME, t_stop) %>% group_by(PLAYER_NAME) %>%
@@ -1717,11 +1713,11 @@ orders injury count across the season (Spearman rho =
 `r round(rho_events, 2)`), so the three profiles illustrate a real
 relationship rather than standing in for one.
 
-Two of three line up. Jalen Johnson sits above the IQR essentially all
-season (`r get_stat("Jalen Johnson", "% games above league median")`%)
-with `r get_stat("Jalen Johnson", "Injury events")` onsets, the season's
+Jalen Johnson sits above the IQR essentially all season
+(`r get_stat("Jalen Johnson", "% games above league median")`%) with
+`r get_stat("Jalen Johnson", "Injury events")` onsets, the season's
 highest burden. Jamal Shead runs along the bottom unbroken with none.
-LeBron James is the miss: average-risk read,
+LeBron James is average-risk/above avg read,
 `r get_stat("LeBron James", "Injury events")` onsets. At concordance
 `r round(summary(m3)$concordance[1], 2)` about one pair in three is
 ordered wrongly, so a three-player figure has no right to be immune.
@@ -2286,12 +2282,39 @@ p_neg <- ggplot(neg, aes(tier, hr, colour = what, group = what)) +
                     guide = "none") +
   scale_y_continuous(limits = c(0.75, 2.85), breaks = c(1, 1.5, 2, 2.5)) +
   labs(title = "Load cannot cause a jammed finger, but it predicts one",
-       subtitle = paste("Hazard ratio per SD; hollow points are not significant.",
-                        "Chronic load is largest in the control.",
-                        "Acute load only bites where a pathology is named."),
+       # two lines: as one string this ran off the right edge of the exported PNG
+       subtitle = paste0("Hazard ratio per SD; hollow points are not significant.\n",
+                         "Chronic load is largest in the CONTROL. ",
+                         "Acute load only bites where a pathology is named."),
        x = NULL, y = "Hazard ratio") +
   pres_theme
 psave(p_neg, "P1_negative_control")
+
+## P1a - the same axes carrying the chronic series alone. The talk shows this first:
+## chronic load is HIGHEST on the injuries load cannot cause, which settles it as
+## exposure before the acute series arrives and splits the argument in two. Same
+## scales as P1 so the second slide reads as the first with a line added.
+p_neg1 <- ggplot(filter(neg, what == "Chronic load (28d)"),
+                 aes(tier, hr, colour = what, group = what)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey55", linewidth = .7) +
+  geom_line(linewidth = 1.6) +
+  geom_point(aes(shape = sig, fill = what), size = 5.5, stroke = 1.6) +
+  geom_text(aes(label = label), vjust = -0.85, size = 5.2, fontface = "bold",
+            lineheight = .85, show.legend = FALSE) +
+  annotate("segment", x = 3.55, xend = 3.9, y = 2.42, yend = 2.42,
+           colour = "grey35", linewidth = .5) +
+  annotate("text", x = 3.72, y = 2.62, label = "load cannot cause these",
+           size = 4.6, colour = "grey25", fontface = "italic") +
+  scale_shape_manual(values = c(`TRUE` = 21, `FALSE` = 1), guide = "none") +
+  scale_colour_manual(values = c("Chronic load (28d)" = "#2166AC")) +
+  scale_fill_manual(values = c("Chronic load (28d)" = "#2166AC"), guide = "none") +
+  scale_y_continuous(limits = c(0.75, 2.85), breaks = c(1, 1.5, 2, 2.5)) +
+  labs(title = "Chronic load predicts the injuries it cannot cause",
+       subtitle = paste0("Hazard ratio per SD. Highest estimate sits on the CONTROL",
+                         " tier.\nThat is exposure, not fatigue."),
+       x = NULL, y = "Hazard ratio") +
+  pres_theme
+psave(p_neg1, "P1a_chronic_only")
 
 ## P2 - calibration, simplified
 p_cal <- ggplot(calib, aes(risk_group, event_rate_1k)) +

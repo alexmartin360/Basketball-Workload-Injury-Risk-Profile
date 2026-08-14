@@ -1,61 +1,34 @@
 # -*- coding: utf-8 -*-
 """
 NBA Schedule & Travel Scraper
-=============================
-This builds the team-level schedule context my thesis uses for congestion and
-travel: for every team-game I work out rest days, whether it was a back-to-back,
-how far the team flew to get there, and whether it was a late local tip-off.
-
-I pull the full season schedule from ScheduleLeagueV2, attach each arena's
-latitude/longitude/timezone from a lookup table, then expand it to one row per
-team per game and compute the rest/travel features. Player-level rolling windows
-and road-trip counters are built later in R — this script just lays down the
-per-game facts they need.
-
-I keep pre-season / all-star / playoff rows in the file on purpose so the rest
-and travel gaps carry across them; R filters down to regular-season games (game
-ID prefix "002") when it builds the panel.
-
-Output : nba_schedule/nba_schedule_{season}.csv       (one per season)
-         nba_schedule/nba_schedule_all_seasons.csv     (combined)
-
-It is incremental — existing season files are skipped, the current season is
-always refreshed.
-
-Requires: pip install nba_api pandas
+Builds the team-level schedule context: rest days, back-to-backs, distance flown and
+late local tip-offs, one row per team per game.
+Output: data/raw/nba_schedule/nba_schedule_{season}.csv (+ a combined file).
+Incremental - existing seasons are skipped, the current one is always refreshed.
 """
 
 import time
 import random
 import logging
 from datetime import datetime
-from math import radians, sin, cos, sqrt, atan2
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 from nba_api.stats.endpoints import scheduleleaguev2
 
-# --- Configuration -----------------------------------------------------------
-
 FIRST_SEASON = "2015-16"
-ROOT_DIR     = Path(__file__).resolve().parent.parent   # repo root (parent of python/)
+ROOT_DIR     = Path(__file__).resolve().parent.parent
 OUTPUT_DIR   = ROOT_DIR / "data" / "raw" / "nba_schedule"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-DELAY_MIN, DELAY_MAX = 2.0, 4.0
-INTER_SEASON_PAUSE   = 6
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s  %(message)s",
+                    datefmt="%H:%M:%S")
 log = logging.getLogger("nba_schedule")
 
-# Arena lookup: city name -> (lat, lon, IANA timezone). Includes relocated and
-# historical names, plus the international / neutral venues that turned up in my
-# 2021-26 window. A city missing here produces null travel, so the run warns me.
+# Arena city -> (lat, lon, timezone). Covers relocations and the neutral / international
+# venues in the study window; a city missing here produces null travel, so the run warns.
 ARENA_LOOKUP = {
     "Atlanta":        (33.7573, -84.3963,  "America/New_York"),
     "Boston":         (42.3662, -71.0621,  "America/New_York"),
@@ -94,42 +67,26 @@ ARENA_LOOKUP = {
     "Salt Lake City": (40.7683, -111.9011, "America/Denver"),
     "Washington":     (38.8981, -77.0209,  "America/New_York"),
     "Las Vegas":      (36.0909, -115.1778, "America/Los_Angeles"),
-    "Inglewood":           (33.9451, -118.3431, "America/Los_Angeles"),  # Intuit Dome (Clippers 2024+)
-    "Austin":              (30.2030, -97.7220,  "America/Chicago"),       # Moody Center
-    "Paris":               (48.8939, 2.3567,    "Europe/Paris"),
-    "London":              (51.5550, -0.0173,   "Europe/London"),
-    "Berlin":              (52.5063, 13.4432,   "Europe/Berlin"),
-    "Mexico City":         (19.4061, -99.0907,  "America/Mexico_City"),
-    "Mexico City, Mexico": (19.4061, -99.0907,  "America/Mexico_City"),
+    "Inglewood":      (33.9451, -118.3431, "America/Los_Angeles"),
+    "Austin":         (30.2030, -97.7220,  "America/Chicago"),
+    "Paris":          (48.8939, 2.3567,    "Europe/Paris"),
+    "London":         (51.5550, -0.0173,   "Europe/London"),
+    "Berlin":         (52.5063, 13.4432,   "Europe/Berlin"),
+    "Mexico City":    (19.4061, -99.0907,  "America/Mexico_City"),
+    "Mexico City, Mexico": (19.4061, -99.0907, "America/Mexico_City"),
 }
 
 
-# --- Season helpers ----------------------------------------------------------
-
 def current_nba_season() -> str:
-    """The season in progress today (the NBA season starts in October)."""
     today = datetime.today()
     start = today.year if today.month >= 10 else today.year - 1
     return f"{start}-{str(start + 1)[-2:]}"
 
 
 def build_season_list(first: str, last: str) -> list[str]:
-    """All season strings from first to last inclusive."""
-    seasons, year = [], int(first.split("-")[0])
-    while year <= int(last.split("-")[0]):
-        seasons.append(f"{year}-{str(year + 1)[-2:]}")
-        year += 1
-    return seasons
+    years = range(int(first.split("-")[0]), int(last.split("-")[0]) + 1)
+    return [f"{y}-{str(y + 1)[-2:]}" for y in years]
 
-
-def missing_seasons(all_seasons: list[str]) -> list[str]:
-    """Seasons with no CSV yet; the current season is always refreshed."""
-    current = current_nba_season()
-    return [s for s in all_seasons
-            if not (OUTPUT_DIR / f"nba_schedule_{s}.csv").exists() or s == current]
-
-
-# --- Geometry ----------------------------------------------------------------
 
 def get_arena_info(city: str):
     """(lat, lon, tz) for an arena city, with a fuzzy substring fallback."""
@@ -137,76 +94,54 @@ def get_arena_info(city: str):
         return None
     if city in ARENA_LOOKUP:
         return ARENA_LOOKUP[city]
-    for key, val in ARENA_LOOKUP.items():
-        if key.lower() in city.lower() or city.lower() in key.lower():
-            return val
-    return None
+    return next((v for k, v in ARENA_LOOKUP.items()
+                 if k.lower() in city.lower() or city.lower() in k.lower()), None)
 
 
-def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    """Great-circle distance in km between two lat/lon points."""
-    dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    return 6371.0 * 2 * atan2(sqrt(a), sqrt(1 - a))
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance in km; works on scalars or arrays."""
+    lat1, lon1, lat2, lon2 = map(np.radians, (lat1, lon1, lat2, lon2))
+    a = np.sin((lat2 - lat1) / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2
+    return 6371.0 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
-
-# --- Fetch + feature engineering ---------------------------------------------
 
 def fetch_schedule(season: str) -> "pd.DataFrame | None":
-    """Fetch the full ScheduleLeagueV2 schedule for a season (all game types)."""
     for attempt in range(1, 4):
         try:
-            df = scheduleleaguev2.ScheduleLeagueV2(season=season, league_id="00").get_data_frames()[0]
-            log.info("[%s] Schedule: %d games", season, len(df))
-            return df
+            return scheduleleaguev2.ScheduleLeagueV2(season=season,
+                                                     league_id="00").get_data_frames()[0]
         except Exception as exc:
             log.warning("[%s] Schedule attempt %d/3 failed: %s", season, attempt, exc)
-            if attempt < 3:
-                time.sleep(random.uniform(5 * attempt, 10 * attempt))
-    log.error("[%s] Schedule — all retries exhausted.", season)
+            time.sleep(random.uniform(5 * attempt, 10 * attempt))
+    log.error("[%s] Schedule - all retries exhausted.", season)
     return None
 
 
 def enrich_schedule(schedule: pd.DataFrame) -> pd.DataFrame:
-    """Keep the columns I need, attach arena lat/lon, and flag late local tip-offs."""
-    keep = [
-        "gameId", "gameDate", "gameDateTimeUTC", "monthNum", "weekNumber", "arenaCity",
-        "homeTeam_teamId", "homeTeam_teamTricode",
-        "awayTeam_teamId", "awayTeam_teamTricode",
-    ]
+    """Keep the columns needed, attach arena lat/lon, and flag late local tip-offs."""
+    keep = ["gameId", "gameDate", "gameDateTimeUTC", "monthNum", "weekNumber", "arenaCity",
+            "homeTeam_teamId", "homeTeam_teamTricode",
+            "awayTeam_teamId", "awayTeam_teamTricode"]
     df = schedule[[c for c in keep if c in schedule.columns]].copy()
     df["gameDateTimeUTC"] = pd.to_datetime(df["gameDateTimeUTC"], utc=True, errors="coerce")
     df["gameDate"] = pd.to_datetime(df["gameDate"], errors="coerce").dt.date
 
-    df["ARENA_LAT"] = None
-    df["ARENA_LON"] = None
+    info = df["arenaCity"].astype(str).map(get_arena_info)
+    df["ARENA_LAT"] = info.map(lambda v: v[0] if v else None)
+    df["ARENA_LON"] = info.map(lambda v: v[1] if v else None)
+
+    # Tip-off at or after 9pm local, converted a timezone at a time.
+    tz = info.map(lambda v: v[2] if v else None)
     df["IS_LATE_GAME"] = None
+    for zone, rows in df.groupby(tz).groups.items():
+        local = df.loc[rows, "gameDateTimeUTC"].dt.tz_convert(ZoneInfo(zone))
+        df.loc[rows, "IS_LATE_GAME"] = local.dt.hour.ge(21).astype(float).where(local.notna())
 
-    # Row-wise because the timezone conversion is per-arena. Runs only on new
-    # seasons (the incremental gate), so this loop is cheap in practice.
-    unmapped: dict[str, int] = {}
-    for idx, row in df.iterrows():
-        info = get_arena_info(str(row.get("arenaCity", "")))
-        if not info:
-            unmapped[str(row.get("arenaCity", ""))] = unmapped.get(str(row.get("arenaCity", "")), 0) + 1
-            continue
-        lat, lon, tz = info
-        df.at[idx, "ARENA_LAT"] = lat
-        df.at[idx, "ARENA_LON"] = lon
-        if pd.notna(row["gameDateTimeUTC"]):
-            local = row["gameDateTimeUTC"].astimezone(ZoneInfo(tz))
-            df.at[idx, "IS_LATE_GAME"] = int(local.hour >= 21)   # tip-off at/after 9pm local
-
-    # Only warn about regular-season venues (game ID prefix 002) — those reach
-    # the panel, so a missing lookup entry there means missing travel data.
-    reg_unmapped = {
-        c: n for c, n in unmapped.items()
-        if ((df["arenaCity"].astype(str) == c) &
-            (df["gameId"].astype(str).str[:3] == "002")).any()
-    }
-    if reg_unmapped:
+    # Only regular-season venues reach the panel, so only warn about those.
+    unmapped = df.loc[info.isna() & df["gameId"].astype(str).str.startswith("002"), "arenaCity"]
+    if not unmapped.empty:
         log.warning("Unmapped regular-season arenaCity (add to ARENA_LOOKUP): %s",
-                    ", ".join(f"{c} (x{n})" for c, n in sorted(reg_unmapped.items())))
+                    ", ".join(f"{c} (x{n})" for c, n in unmapped.value_counts().items()))
     return df
 
 
@@ -221,74 +156,51 @@ def add_team_game_features(df: pd.DataFrame) -> pd.DataFrame:
         out["IS_HOME"], out["IS_AWAY"] = is_home, 1 - is_home
         return out
 
-    long_df = pd.concat([side(1), side(0)], ignore_index=True)
-    long_df["gameDate_dt"] = pd.to_datetime(long_df["gameDate"])
-    long_df = long_df.sort_values(["TEAM_ID", "gameDateTimeUTC"]).reset_index(drop=True)
+    long_df = pd.concat([side(1), side(0)], ignore_index=True) \
+                .sort_values(["TEAM_ID", "gameDateTimeUTC"]).reset_index(drop=True)
 
-    # Rest = full calendar days between games; 0 rest days => back-to-back.
-    prev_date = long_df.groupby("TEAM_ID")["gameDate_dt"].shift(1)
-    long_df["DAYS_REST"] = (long_df["gameDate_dt"] - prev_date).dt.days - 1
+    # Rest is full calendar days between games, so zero rest is a back-to-back.
+    game_day  = pd.to_datetime(long_df["gameDate"])
+    prev_date = game_day.groupby(long_df["TEAM_ID"]).shift(1)
+    long_df["DAYS_REST"] = (game_day - prev_date).dt.days - 1
     long_df["IS_BACK_TO_BACK"] = (long_df["DAYS_REST"] == 0).astype("Int64")
     long_df.loc[prev_date.isna(), ["DAYS_REST", "IS_BACK_TO_BACK"]] = None
 
-    # Travel = distance flown from the previous arena, only counted for away games.
-    prev_lat = long_df.groupby("TEAM_ID")["ARENA_LAT"].shift(1)
-    prev_lon = long_df.groupby("TEAM_ID")["ARENA_LON"].shift(1)
+    # Travel is the distance flown from the previous arena, counted on away games only.
+    lat, lon = long_df["ARENA_LAT"].astype(float), long_df["ARENA_LON"].astype(float)
+    prev_lat = lat.groupby(long_df["TEAM_ID"]).shift(1)
+    prev_lon = lon.groupby(long_df["TEAM_ID"]).shift(1)
+    km = pd.Series(haversine_km(prev_lat, prev_lon, lat, lon), index=long_df.index).round(1)
+    long_df["TRAVEL_DISTANCE_KM"] = km.where(long_df["IS_AWAY"].eq(1) & prev_lat.notna() &
+                                             prev_lon.notna() & lat.notna() & lon.notna())
+    return long_df
 
-    def travel(r, plat, plon):
-        if r["IS_AWAY"] == 0 or any(pd.isna(v) for v in (plat, plon, r["ARENA_LAT"], r["ARENA_LON"])):
-            return None
-        return round(haversine_km(float(plat), float(plon),
-                                  float(r["ARENA_LAT"]), float(r["ARENA_LON"])), 1)
-
-    log.info("Computing travel distances ...")
-    long_df["TRAVEL_DISTANCE_KM"] = [
-        travel(r, prev_lat.iloc[i], prev_lon.iloc[i]) for i, r in long_df.iterrows()
-    ]
-    return long_df.drop(columns=["gameDate_dt"])
-
-
-def process_season(season: str) -> "pd.DataFrame | None":
-    """Fetch and build the per-team-game schedule table for one season."""
-    raw = fetch_schedule(season)
-    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-    if raw is None or raw.empty:
-        log.warning("[%s] No schedule — skipping.", season)
-        return None
-    team_games = add_team_game_features(enrich_schedule(raw))
-    team_games.insert(0, "SEASON", season)
-    log.info("[%s] Built %d team-game rows", season, len(team_games))
-    return team_games
-
-
-# --- Main --------------------------------------------------------------------
 
 def main() -> None:
     all_seasons = build_season_list(FIRST_SEASON, current_nba_season())
-    log.info("Season range: %s -> %s", all_seasons[0], all_seasons[-1])
-
-    to_fetch = missing_seasons(all_seasons)
+    current     = current_nba_season()
+    to_fetch = [s for s in all_seasons
+                if not (OUTPUT_DIR / f"nba_schedule_{s}.csv").exists() or s == current]
     log.info("Seasons to fetch: %s", to_fetch or "none")
 
     for i, season in enumerate(to_fetch):
-        log.info("=" * 55)
         log.info("Season %s  (%d/%d)", season, i + 1, len(to_fetch))
-        df = process_season(season)
-        if df is not None and not df.empty:
-            df.to_csv(OUTPUT_DIR / f"nba_schedule_{season}.csv", index=False)
-            log.info("[%s] Saved %d rows", season, len(df))
-        if i < len(to_fetch) - 1:
-            time.sleep(INTER_SEASON_PAUSE)
+        raw = fetch_schedule(season)
+        time.sleep(random.uniform(2.0, 4.0))
+        if raw is None or raw.empty:
+            continue
+        team_games = add_team_game_features(enrich_schedule(raw))
+        team_games.insert(0, "SEASON", season)
+        team_games.to_csv(OUTPUT_DIR / f"nba_schedule_{season}.csv", index=False)
+        log.info("[%s] Saved %d team-game rows", season, len(team_games))
+        time.sleep(6)
 
-    # Rebuild the combined file from every season CSV on disk.
     frames = [pd.read_csv(OUTPUT_DIR / f"nba_schedule_{s}.csv", low_memory=False)
               for s in all_seasons if (OUTPUT_DIR / f"nba_schedule_{s}.csv").exists()]
     if frames:
-        combined = pd.concat(frames, ignore_index=True)
-        combined.to_csv(OUTPUT_DIR / "nba_schedule_all_seasons.csv", index=False)
-        log.info("Combined saved -> %d rows, %d seasons", len(combined), len(frames))
-    else:
-        log.error("No season files found — combined file not written.")
+        pd.concat(frames, ignore_index=True).to_csv(
+            OUTPUT_DIR / "nba_schedule_all_seasons.csv", index=False)
+        log.info("Combined -> %d rows, %d seasons", sum(map(len, frames)), len(frames))
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python python/nba_injuries.py         # official injury report PDFs → parquet
 python python/nba_schedule.py         # league schedule + travel distances
-python python/nba_player_travel.py    # game logs, rosters, career stats
+python python/nba_player_travel.py    # game logs, player bio, career stats
 python python/nba_player_tracking.py  # player tracking load (distance)
 ```
 
