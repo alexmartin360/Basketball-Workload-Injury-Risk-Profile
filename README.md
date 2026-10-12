@@ -1,6 +1,9 @@
 # Basketball-Workload-Injury-Risk-Profile
 
-Investigates how patterns of matches, training load, recovery relate to injury risk in basketball. Quantify how changes in workload accumulation, cumulative effects, schedule influence likelihood of injury that could lead to reduction, using time to event modelling. Designed to produce evidence that can inform applied load management decisions.
+Investigates how workload and schedule congestion relate to injury risk across five NBA
+regular seasons, using counting-process Cox (time-to-event) models fitted to public data:
+official pre-game injury reports, game logs, the league schedule and player tracking. The
+model ranks relative injury risk across the league rather than predicting individual injuries.
 
 Master of Sports Analytics thesis (La Trobe University) — *Workload, Schedule Congestion,
 and Injury Risk in the NBA: A Time-to-Event Perspective*. Five NBA seasons (2021-22 → 2025-26).
@@ -11,7 +14,12 @@ and Injury Risk in the NBA: A Time-to-Event Perspective*. Five NBA seasons (2021
 ├── python/         # NBA data collectors (injury reports, schedule, travel, tracking load)
 ├── analysis/       # R pipeline — scripts 1-5 build the data, 6 (.Rmd) models & reports
 │   └── Archive/    # superseded pre-.Rmd scripts, kept for reference (gitignored)
-├── docs/           # rendered outputs (knitted HTML report + supporting PDF)
+├── docs/           # final article, presentation and knitted report
+│   ├── SPB_Alex_Martin.docx               # journal article
+│   ├── SPB_Presentation_AlexMartin.pptx   # oral presentation
+│   ├── 6.-Cox-Modelling.html              # knitted analysis report
+│   ├── figures/    # article figures; presentation/ holds the slide figures
+│   └── tables/     # one CSV per article and appendix table
 ├── data/           # generated data (gitignored) — raw/ = scraped, processed/ = built .rds
 ├── requirements.txt
 └── *.Rproj         # RStudio project — open at the repo root
@@ -48,6 +56,14 @@ proportional-hazards modelling of workload and schedule congestion against injur
 with proportional-hazards diagnostics, a recurrent-events robustness suite (Andersen-Gill,
 PWP gap-time, shared frailty), an injury-mechanism split, and out-of-sample validation
 (temporal + player-grouped cross-validation).
+
+## The article
+
+[`docs/SPB_Alex_Martin.docx`](docs/SPB_Alex_Martin.docx) is the journal article and
+[`docs/SPB_Presentation_AlexMartin.pptx`](docs/SPB_Presentation_AlexMartin.pptx) the oral
+presentation. Every figure and table in them is written by the `.Rmd` into `docs/figures/`
+and `docs/tables/`, so knitting the report reproduces them. The cited papers are listed in
+the article's reference list; their PDFs are not distributed here.
 
 ## Requirements
 

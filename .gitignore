@@ -7,7 +7,7 @@
 .Rproj.user
 .Rhistory
 .RData
-.RDataTmp
+.RDataTmp*
 .Ruserdata
 *.Rproj.user
 
@@ -57,6 +57,10 @@ Archive/
 # Work in progress: drafts, article plans and study notes kept local until they
 # are ready to publish (the knitted report in docs/ is the source of figures)
 docs/In Progress/
+
+# Reference library: the cited papers' PDFs are publisher copyright, so they stay
+# local and were removed from the repository history so the repo can be public
+docs/References/
 
 # Office lock/temp files (Word writes these while a .docx or .pptx is open)
 ~$*
