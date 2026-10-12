@@ -1,5 +1,5 @@
 "Model","theta","SD (log hazard)","Hazard, +1 SD of proneness","90th vs 10th percentile"
 "No covariates (baseline)",0.963,0.981,2.67,12.36
-"+ Workload",0.763,0.873,2.39,9.38
-"+ Schedule congestion",0.694,0.833,2.3,8.46
-"+ Player context (full)",0.316,0.562,1.75,4.22
+"+ Workload",0.756,0.87,2.39,9.29
+"+ Schedule congestion",0.64,0.8,2.23,7.78
+"+ Player context (full)",0.293,0.541,1.72,4

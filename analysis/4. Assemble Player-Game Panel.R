@@ -100,8 +100,9 @@ stopifnot(nrow(count(panel, SEASON, PLAYER_ID, GAME_DATE) %>% filter(n > 1)) == 
 message("  ", nrow(panel), " rows | ", n_distinct(panel$PLAYER_ID), " players | ",
         sum(panel$PLAYED_FLAG), " played")
 
-# ── 2. Appearance metrics ── congestion, rolling minutes, road trips
-# All computed on games the player actually appeared in, then joined back on.
+# ── 2. Appearance metrics ── per-game congestion flags, road trips, travel legs
+# All computed on games the player actually appeared in, then joined back on. These
+# describe a single appearance; the rolling exposure windows are built in section 3.
 message("\n[2] Appearance metrics ...")
 
 appeared <- panel %>%
@@ -113,22 +114,12 @@ appeared <- panel %>%
     IS_B2B     = as.integer(PLAYER_DAYS_SINCE_LAST_PLAYED == 0),
     IS_B2B_2ND = IS_B2B,
     IS_B2B_1ST = as.integer(dplyr::lead(IS_B2B, default = 0L) == 1 & IS_B2B == 0),
-    SEASON_B2B_COUNT = cumsum(replace_na(IS_B2B, 0)),
+    # Appearance index. Script 5 uses its NA pattern (NA before the first appearance) to
+    # left-truncate, so it stays appearance-based rather than a pre-game window.
     GAMES_PLAYED     = row_number(),
     IS_3IN4 = as.integer(slide_index_dbl(rep(1, n()), GAME_DATE, sum, .before = days(3)) >= 3),
     IS_4IN5 = as.integer(slide_index_dbl(rep(1, n()), GAME_DATE, sum, .before = days(4)) >= 4),
     IS_5IN7 = as.integer(slide_index_dbl(rep(1, n()), GAME_DATE, sum, .before = days(6)) >= 5),
-    ROLLING_MIN_7D   = slide_index_dbl(MIN, GAME_DATE, sum, .before = days(7)),
-    ROLLING_MIN_28D  = slide_index_dbl(MIN, GAME_DATE, sum, .before = days(28)),
-    ROLLING_MIN_42D  = slide_index_dbl(MIN, GAME_DATE, sum, .before = days(42)),
-    SEASON_CUMULATIVE_MIN = cumsum(MIN),
-    ROLLING_GAMES_7D  = slide_index_dbl(rep(1, n()), GAME_DATE, sum, .before = days(7)),
-    ROLLING_GAMES_28D = slide_index_dbl(rep(1, n()), GAME_DATE, sum, .before = days(28)),
-    ROLLING_B2B_7D    = slide_index_dbl(replace_na(IS_B2B, 0L), GAME_DATE, sum, .before = days(7)),
-    ROLLING_B2B_28D   = slide_index_dbl(replace_na(IS_B2B, 0L), GAME_DATE, sum, .before = days(28)),
-    # Acute:chronic minutes, undefined until there are 4 games in the chronic window.
-    ACWR_MIN = if_else(ROLLING_MIN_28D > 0 & ROLLING_GAMES_28D >= 4,
-                       round(ROLLING_MIN_7D / (ROLLING_MIN_28D / 4), 3), NA_real_),
     away_run = { r <- rle(IS_AWAY == 1); rep(seq_along(r$lengths) * r$values, r$lengths) },
     # A player road trip needs at least two consecutive away games.
     IS_PLAYER_ROAD_TRIP = as.integer(away_run > 0 & ave(away_run, away_run, FUN = length) >= 2),
@@ -140,18 +131,12 @@ appeared <- panel %>%
       dlon <- (ARENA_LON - dplyr::lag(ARENA_LON)) * pi / 180
       a <- sin((lat2 - lat1) / 2)^2 + cos(lat1) * cos(lat2) * sin(dlon / 2)^2
       if_else(is.na(lat1) | is.na(lat2), NA_real_, 6371 * 2 * atan2(sqrt(a), sqrt(1 - a)))
-    },
-    ROLLING_DIST_7D  = slide_index_dbl(replace_na(PLAYER_TRAVEL_KM, 0), GAME_DATE, sum, .before = days(7)),
-    ROLLING_DIST_28D = slide_index_dbl(replace_na(PLAYER_TRAVEL_KM, 0), GAME_DATE, sum, .before = days(28)),
-    SEASON_CUMULATIVE_DIST = cumsum(replace_na(PLAYER_TRAVEL_KM, 0))
+    }
   ) %>%
   ungroup() %>%
   select(SEASON, PLAYER_ID, GAME_ID, PLAYER_DAYS_SINCE_LAST_PLAYED, IS_B2B, IS_B2B_1ST,
-         IS_B2B_2ND, SEASON_B2B_COUNT, GAMES_PLAYED, IS_3IN4, IS_4IN5, IS_5IN7,
-         ROLLING_MIN_7D, ROLLING_MIN_28D, ROLLING_MIN_42D, SEASON_CUMULATIVE_MIN,
-         ROLLING_GAMES_7D, ROLLING_GAMES_28D, ROLLING_B2B_7D, ROLLING_B2B_28D, ACWR_MIN,
-         IS_PLAYER_ROAD_TRIP, PLAYER_ROAD_TRIP_GAME_NUMBER, PLAYER_TRAVEL_KM,
-         ROLLING_DIST_7D, ROLLING_DIST_28D, SEASON_CUMULATIVE_DIST)
+         IS_B2B_2ND, GAMES_PLAYED, IS_3IN4, IS_4IN5, IS_5IN7,
+         IS_PLAYER_ROAD_TRIP, PLAYER_ROAD_TRIP_GAME_NUMBER, PLAYER_TRAVEL_KM)
 
 panel <- panel %>% left_join(appeared, by = c("SEASON", "PLAYER_ID", "GAME_ID"))
 
@@ -171,23 +156,66 @@ panel <- panel %>%
                          "POSSESSIONS", "PACE")),
                 ~ if_else(PLAYED_FLAG == 1, as.numeric(.x), NA_real_)))
 
-tracking_load <- panel %>%
-  filter(PLAYED_FLAG == 1) %>%
+# ── 3b. Rolling exposure windows ──
+# Every window sums the player's own appearances dated strictly BEFORE this row's game:
+# the 7, 28 or 42 days up to the day before, or the season to date. It is computed on
+# every row, played, rested or injured, so its value is known before the interval opens
+# and nothing has to be carried forward onto missed games.
+#
+# An earlier version summed over appearances only, so a played row's window included
+# that night's game, and then carried the last value forward onto missed games. At an
+# injury onset the injured player's window therefore stopped at his last appearance,
+# while every comparator who played that night had one more game in his: a timing
+# difference between the case and the rest of the risk set, not a pre-game exposure.
+message("\n[3b] Rolling exposure windows (pre-game) ...")
+
+# [d - w, d] minus day d itself = exactly the w days before the game. One row per
+# player-date (asserted in section 1), so the row's own value is the only day-d entry.
+pre_game_sum <- function(x, dates, w) slide_index_dbl(x, dates, sum, .before = days(w)) - x
+
+window_cols <- c("ROLLING_MIN_7D", "ROLLING_MIN_28D", "ROLLING_MIN_42D", "SEASON_CUMULATIVE_MIN",
+                 "ROLLING_GAMES_7D", "ROLLING_GAMES_28D", "ROLLING_LOAD_7D", "ROLLING_LOAD_28D",
+                 "ROLLING_DIST_7D", "ROLLING_DIST_28D", "SEASON_CUMULATIVE_DIST",
+                 "ROLLING_B2B_7D", "ROLLING_B2B_28D", "SEASON_B2B_COUNT")
+
+panel <- panel %>%
   arrange(SEASON, PLAYER_ID, GAME_DATE) %>%
   group_by(SEASON, PLAYER_ID) %>%
-  mutate(ROLLING_LOAD_7D  = slide_index_dbl(replace_na(DISTANCE, 0), GAME_DATE, sum, .before = days(7)),
-         ROLLING_LOAD_28D = slide_index_dbl(replace_na(DISTANCE, 0), GAME_DATE, sum, .before = days(28)),
-         ACWR_LOAD = if_else(ROLLING_LOAD_28D > 0 &
-                               slide_index_dbl(rep(1, n()), GAME_DATE, sum, .before = days(28)) >= 4,
-                             round(ROLLING_LOAD_7D / (ROLLING_LOAD_28D / 4), 3), NA_real_)) %>%
+  mutate(
+    app_  = as.numeric(PLAYED_FLAG == 1),          # 1 on an appearance, 0 otherwise
+    min_  = app_ * replace_na(as.numeric(MIN), 0),
+    load_ = app_ * replace_na(DISTANCE, 0),
+    trav_ = app_ * replace_na(PLAYER_TRAVEL_KM, 0),
+    b2b_  = app_ * replace_na(as.numeric(IS_B2B), 0),
+    ROLLING_MIN_7D    = pre_game_sum(min_,  GAME_DATE, 7),
+    ROLLING_MIN_28D   = pre_game_sum(min_,  GAME_DATE, 28),
+    ROLLING_MIN_42D   = pre_game_sum(min_,  GAME_DATE, 42),
+    SEASON_CUMULATIVE_MIN = cumsum(min_) - min_,
+    ROLLING_GAMES_7D  = pre_game_sum(app_,  GAME_DATE, 7),
+    ROLLING_GAMES_28D = pre_game_sum(app_,  GAME_DATE, 28),
+    ROLLING_LOAD_7D   = pre_game_sum(load_, GAME_DATE, 7),
+    ROLLING_LOAD_28D  = pre_game_sum(load_, GAME_DATE, 28),
+    ROLLING_DIST_7D   = pre_game_sum(trav_, GAME_DATE, 7),
+    ROLLING_DIST_28D  = pre_game_sum(trav_, GAME_DATE, 28),
+    SEASON_CUMULATIVE_DIST = cumsum(trav_) - trav_,
+    ROLLING_B2B_7D    = pre_game_sum(b2b_,  GAME_DATE, 7),
+    ROLLING_B2B_28D   = pre_game_sum(b2b_,  GAME_DATE, 28),
+    SEASON_B2B_COUNT  = cumsum(b2b_) - b2b_
+  ) %>%
   ungroup() %>%
-  select(SEASON, PLAYER_ID, GAME_ID, ROLLING_LOAD_7D, ROLLING_LOAD_28D, ACWR_LOAD)
+  # summing then subtracting leaves floating-point dust either side of zero
+  mutate(across(all_of(window_cols), ~ pmax(0, round(.x, 6)))) %>%
+  select(-app_, -min_, -load_, -trav_, -b2b_)
 
 # Intensity is distance per minute. A rate needs a base of minutes to mean anything, and
 # a played game recording zero distance is a tracking-feed failure rather than a real 0.
+# The acute:chronic ratios are undefined until four appearances sit in the chronic window.
 panel <- panel %>%
-  left_join(tracking_load, by = c("SEASON", "PLAYER_ID", "GAME_ID")) %>%
-  mutate(INTENSITY = if_else(!is.na(MIN) & MIN >= 10 & !is.na(DISTANCE) & DISTANCE > 0,
+  mutate(ACWR_MIN  = if_else(ROLLING_MIN_28D  > 0 & ROLLING_GAMES_28D >= 4,
+                             round(ROLLING_MIN_7D  / (ROLLING_MIN_28D  / 4), 3), NA_real_),
+         ACWR_LOAD = if_else(ROLLING_LOAD_28D > 0 & ROLLING_GAMES_28D >= 4,
+                             round(ROLLING_LOAD_7D / (ROLLING_LOAD_28D / 4), 3), NA_real_),
+         INTENSITY = if_else(!is.na(MIN) & MIN >= 10 & !is.na(DISTANCE) & DISTANCE > 0,
                              DISTANCE / MIN, NA_real_),
          ROLLING_INTENSITY_7D  = if_else(ROLLING_MIN_7D  >= 30, ROLLING_LOAD_7D  / ROLLING_MIN_7D,  NA_real_),
          ROLLING_INTENSITY_28D = if_else(ROLLING_MIN_28D >= 60, ROLLING_LOAD_28D / ROLLING_MIN_28D, NA_real_))

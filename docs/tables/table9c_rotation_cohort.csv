@@ -1,8 +1,8 @@
 "Metric","All players (primary)","Rotation players only"
 "Player-intervals (n)",166703,106822
 "Events",3921,3239
-"Concordance",0.7069,0.6699
-"Chronic load HR (per SD)",1.758,1.724
-"Acute load HR (per SD)",1.286,1.333
-"In-game load, last game",0.483,0.469
-"In-game load, 2 games back",1.534,1.447
+"Concordance",0.7375,0.7042
+"Chronic load HR (per SD)",2.109,2.099
+"Acute load HR (per SD)",0.963,1
+"In-game load, last game",0.467,0.45
+"In-game load, 2 games back",1.515,1.454

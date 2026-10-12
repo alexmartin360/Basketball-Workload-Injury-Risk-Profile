@@ -1,14 +1,15 @@
 
 # 5. Build Survival Dataset
 # Reshapes the panel into the counting-process format coxph() wants for time-varying
-# covariates: one interval per player-game, (t_start, t_stop], an event flag, and every
-# covariate carried forward so no interval is missing its recent workload.
+# covariates: one interval per player-game, (t_start, t_stop], and an event flag. The
+# rolling workload windows arrive from script 4 already defined on every row and timed
+# to end the day before the game; per-game values are carried forward and then lagged.
 # Input:   data/processed/panel_2021-26.rds
 # Output:  data/processed/cox_ready_2021-26.rds
 #
 # Who is at risk on each row:
 #   played                          -> at risk, covariates observed
-#   absent but not injured (rested) -> at risk, covariates carried forward
+#   absent but not injured (rested) -> at risk, per-game covariates carried forward
 #   already serving an injury spell -> NOT at risk, dropped
 
 library(tidyverse)
@@ -22,19 +23,17 @@ panel <- readRDS(file.path(BASE, "panel_2021-26.rds"))
 stopifnot(all(str_sub(as.character(panel$GAME_ID), 1, 3) == "002"))
 message("Panel loaded: ", nrow(panel), " rows x ", ncol(panel), " cols")
 
-# ── 1. Carry covariates forward onto missed games ──
-# On a missed game the player did not appear, so their in-game covariates are NA. The
-# load a player was carrying going INTO an absence is exactly the exposure
-# attached to it, so the last observed value is carried forward.
-message("\n[1] Carrying covariates forward (LOCF) ...")
+# ── 1. Carry per-game covariates forward onto missed games ──
+# On a missed game the player did not appear, so their in-game covariates are NA; the
+# last observed value is carried forward, and section 2 then lags it so a row only ever
+# sees games played before it. The rolling windows (ROLLING_*, SEASON_CUMULATIVE_*,
+# ACWR_*) are NOT carried: script 4 builds them on every row from appearances dated
+# before the game, so a rested player's window decays as it should and an onset row
+# is timed the same way as every other row in its risk set.
+message("\n[1] Carrying per-game covariates forward (LOCF) ...")
 
 locf_cols <- c(
-  "ROLLING_MIN_7D", "ROLLING_MIN_28D", "ROLLING_MIN_42D", "SEASON_CUMULATIVE_MIN",
-  "ROLLING_GAMES_7D", "ROLLING_GAMES_28D", "ACWR_MIN",
-  "ROLLING_LOAD_7D", "ROLLING_LOAD_28D", "ACWR_LOAD",
-  "INTENSITY", "ROLLING_INTENSITY_7D", "ROLLING_INTENSITY_28D",
-  "ROLLING_DIST_7D", "ROLLING_DIST_28D", "SEASON_CUMULATIVE_DIST",
-  "ROLLING_B2B_7D", "ROLLING_B2B_28D", "SEASON_B2B_COUNT",
+  "INTENSITY",
   "IS_B2B", "IS_B2B_1ST", "IS_B2B_2ND", "IS_3IN4", "IS_4IN5", "IS_5IN7",
   "IS_PLAYER_ROAD_TRIP", "PLAYER_ROAD_TRIP_GAME_NUMBER",
   "GAMES_PLAYED", "PLAYER_DAYS_SINCE_LAST_PLAYED",
